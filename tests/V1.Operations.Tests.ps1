@@ -101,12 +101,15 @@ Describe 'Monitoring operational integration' {
         (Read-DBBackupMetricState $path).LastSuccessTimestamp | Should -Be 0
         Get-Content $path -Raw | Should -Match 'backup_last_attempt_degraded\{[^}]+\} 1'
     }
-    It 'does not change metrics when the instance lock is busy' {
+    It 'reports a failed attempt when the instance stays busy beyond LockWaitMinutes' {
+        Set-Content $script:Config ((Get-Content $script:Config -Raw).Replace('EstimatedDatabaseBytes = 0 }', 'EstimatedDatabaseBytes = 0; LockWaitMinutes = 0 }'))
         $c=Read-DBConfiguration $script:Config
-        $runtime=New-DBRuntime $c
+        $runtime=New-DBRuntime $c -Jobs @('database')
         try {
             Invoke-DBBackup -ConfigPath $script:Config -All | Should -Be 3
-            @(Get-ChildItem $script:Textfile -File).Count | Should -Be 0
+            Get-Content (Join-Path $script:Textfile 'erp__mysql-database.prom') -Raw | Should -Match 'backup_last_attempt_success\{[^}]+\} 0'
+            $log=Get-ChildItem $c.Paths.LogRoot -Filter '*.log' | Where-Object FullName -ne $runtime.LogPath | Sort-Object LastWriteTime | Select-Object -Last 1
+            Get-Content $log.FullName -Raw | Should -Match 'RESULTADO: FALHA \(exit 3\) - jobs com falha: database; a instancia ficou ocupada'
         }
         finally { Close-DBRuntime $runtime }
     }

@@ -4,6 +4,31 @@ Todas as alterações relevantes do DBBackup são registradas neste arquivo. O
 projeto usa as versões semânticas definidas em `VERSION` e as principais seções
 do Keep a Changelog, sem exigir todas as seções em cada versão.
 
+## [2.2.4] - 2026-11-23
+
+### Alterado
+
+- Execuções da mesma instância que se sobrepõem passam a esperar a vez em vez
+  de desistir em silêncio (código 3 sem log nem métrica). A espera vale para
+  outra tarefa, para um disparo da mesma tarefa e para um backup manual.
+  - O limite é `Execution.LockWaitMinutes`, padrão 180 min, no `ambiente.psd1`.
+  - O log registra quem está rodando (`Runtime\DBBackup.lock.json`) e quanto
+    tempo a execução esperou.
+  - Se o limite estourar: `RESULTADO: FALHA (exit 3)` e tentativa com falha nas
+    métricas de cada job (BKP-110).
+- Duas tarefas da instância disparando no mesmo minuto são recusadas na
+  validação; a mensagem sugere +1 minuto. O setup aplica esse +1 minuto sozinho
+  quando o horário de um job novo já é usado por outra tarefa.
+- Tarefas no Agendador: "executar em paralelo" (`Parallel`) em vez de "ignorar
+  nova" (`IgnoreNew`), e o limite de execução inclui a espera (15 h por padrão).
+  Reaplique as instâncias depois de atualizar.
+- A atualização considera ocupada uma instância com execução aguardando o lock.
+
+### Corrigido
+
+- Duas execuções iniciadas no mesmo segundo podiam gravar no mesmo arquivo de
+  log; o nome agora é reservado na criação.
+
 ## [2.2.3] - 2026-11-19
 
 ### Corrigido

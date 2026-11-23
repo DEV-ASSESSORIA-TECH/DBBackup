@@ -64,6 +64,19 @@ Describe 'Incremental schedule' {
         Get-DBScheduleNextRun -Tasks $tasks -Job 'dominio' -After $after -Mode Incremental | Should -Be ([DateTime]::new(2026, 11, 19, 15, 0, 0))
         Get-DBScheduleNextRun -Tasks $tasks -Job 'dominio' -After $after | Should -Be ([DateTime]::new(2026, 11, 19, 19, 0, 0))
     }
+    It 'refuses two tasks firing in the same minute and accepts one minute apart' {
+        $jobs = @([pscustomobject]@{ Id = 'database'; Incremental = $false }, [pscustomobject]@{ Id = 'fiscal'; Incremental = $false })
+        $same = @{ InstanceName = 'acme'; Jobs = $jobs; Schedule = @{ Tasks = @(
+            @{ Name = 'a'; Jobs = @('database'); At = @('12:00', '19:00') }
+            @{ Name = 'b'; Jobs = @('fiscal'); At = @('12:00', '18:30') }) } }
+        { Get-DBScheduleTask $same } | Should -Throw "*mesmo horario (12:00)*'12:01'*"
+        $same.Schedule.Tasks[1].At = @('12:01', '18:30')
+        @(Get-DBScheduleTask $same).Count | Should -Be 2
+        $weekly = @{ InstanceName = 'acme'; Jobs = $jobs; Schedule = @{ Tasks = @(
+            @{ Name = 'a'; Jobs = @('database'); At = '03:00'; Frequency = 'Weekly'; Days = @('Saturday') }
+            @{ Name = 'b'; Jobs = @('fiscal'); At = '03:00'; Frequency = 'Weekly'; Days = @('Sunday') }) } }
+        @(Get-DBScheduleTask $weekly).Count | Should -Be 2
+    }
     It 'refuses an incremental task for a job without Incremental.Enabled' {
         $bad = @{ InstanceName = 'acme'; Jobs = $script:Config.Jobs; Schedule = @{ Tasks = @(@{ Name = 'inc'; Jobs = @('seven'); At = '09:00'; Mode = 'Incremental' }) } }
         { Get-DBScheduleTask $bad } | Should -Throw '*Incremental.Enabled*'

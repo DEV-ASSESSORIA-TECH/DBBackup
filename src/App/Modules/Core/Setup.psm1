@@ -569,6 +569,15 @@ function Add-DBScheduledJob {
     })
     if ($match.Count -gt 0) { $match[0].Jobs = @($match[0].Jobs) + $JobId }
     else {
+        # Same minute as another task of the instance: one minute later, so the order is fixed (it waits for the lock).
+        $taken = @($tasks | Where-Object { $_ -is [Collections.IDictionary] } | ForEach-Object { @($_.At) } | ForEach-Object { [string] $_ })
+        $times = @(foreach ($time in $times) {
+            $value = $time
+            while ($value -in $taken) { $value = [DateTime]::ParseExact($value, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture).AddMinutes(1).ToString('HH:mm') }
+            if ($value -ne $time) { Write-DBSetupMessage "Horario $time ja usado por outra tarefa desta instancia; o job $JobId fica as $value e espera a anterior terminar." }
+            $value
+        })
+        $times = @($times | Sort-Object -Unique)
         $value = if ($times.Count -eq 1) { $times[0] } else { $times }
         $prefix = if ($Mode -eq 'Incremental') { 'incremental-' } else { 'diario-' }
         $task = @{ Name = $prefix + (($times | ForEach-Object { $_.Replace(':', '') }) -join '-'); Jobs = @($JobId); At = $value; Frequency = 'Daily'; Enabled = $true }
@@ -916,7 +925,7 @@ function Invoke-DBScheduleApply {
     $folder = Get-DBTaskFolder
     $existing = @(Get-DBSchedulerSnapshot $folder)
     $plan = @(Get-DBSchedulePlan -Configuration $Configuration -Existing $existing -PwshPath $PwshPath -ScriptPath $ScriptPath -WorkingDirectory (Split-Path $ScriptPath))
-    foreach ($warning in @(Get-DBScheduleWarning @(Get-DBScheduleTask $Configuration))) { Write-Warning $warning }
+    $null = Get-DBScheduleTask $Configuration
     Write-Output "Pasta de tarefas: $folder"
     if ($plan.Count -eq 0) { Write-Output 'Tarefas sem alteracoes.'; return }
     $plan | Select-Object Action,Name | Format-Table | Out-Host

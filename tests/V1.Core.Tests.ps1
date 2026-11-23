@@ -37,7 +37,7 @@ Describe 'DBBackup v1 instance configuration' {
         $c = Read-DBConfiguration $script:Config
         $r = New-DBRuntime $c
         try {
-            New-DBRuntime $c | Should -BeNullOrEmpty
+            (New-DBRuntime $c).Busy | Should -BeTrue
             $other = Join-Path $TestDrive 'other/config.psd1'
             $null = New-Item -ItemType Directory (Split-Path $other)
             Copy-Item $script:Config $other
@@ -45,6 +45,35 @@ Describe 'DBBackup v1 instance configuration' {
             try { $second | Should -Not -BeNullOrEmpty } finally { Close-DBRuntime $second }
         }
         finally { Close-DBRuntime $r }
+    }
+    It 'waits for another run of the instance and logs who held it' {
+        Mock Set-Acl {} -ModuleName Runtime
+        $c = Read-DBConfiguration $script:Config
+        $first = New-DBRuntime $c -Jobs @('database') -Mode Full
+        try {
+            $busy = New-DBRuntime $c -LockWaitSeconds 2 -PollSeconds 1 -Jobs @('fiscal')
+            $busy.Busy | Should -BeTrue
+            $log = Get-Content $busy.LogPath -Raw
+            $log | Should -Match "Aguardando a execucao $($first.RunId) \(jobs database, modo Full"
+            $log | Should -Match 'Desistindo'
+            @(Get-ChildItem (Split-Path -Parent (Split-Path -Parent $first.Work)) -Filter 'DBBackup.wait.*').Count | Should -Be 0
+        }
+        finally { Close-DBRuntime $first }
+        # Another process holds the lock for a few seconds: the run waits and then gets it.
+        $lockPath = Join-Path $c.Paths.RuntimeRoot 'DBBackup.lock'
+        $holder = Start-Process (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-Command', "`$f=[IO.File]::Open('$lockPath','OpenOrCreate','ReadWrite','None'); Start-Sleep 4; `$f.Dispose()") -PassThru
+        try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while ([DateTime]::UtcNow -lt $deadline) { try { [IO.File]::Open($lockPath, 'Open', 'ReadWrite', 'None').Dispose(); Start-Sleep -Milliseconds 200 } catch [IO.IOException] { break } }
+            $r = New-DBRuntime $c -LockWaitSeconds 30 -PollSeconds 1 -Jobs @('fiscal')
+            try {
+                $r.Busy | Should -BeFalse
+                $r.WaitedSeconds | Should -BeGreaterThan 0.5
+                (Get-Content $r.LogPath -Raw) | Should -Match 'Lock obtido apos'
+            }
+            finally { Close-DBRuntime $r }
+        }
+        finally { if (-not $holder.HasExited) { $holder.Kill() } }
     }
     It 'redacts connection passwords including spaces' {
         Protect-DBMessage 'PWD="secret phrase";password=hidden' | Should -Be 'PWD=[REDACTED];password=[REDACTED]'

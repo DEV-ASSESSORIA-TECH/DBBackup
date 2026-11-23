@@ -1,4 +1,4 @@
-# DBBackup — runbook v2.2.3
+# DBBackup — runbook v2.2.4
 
 ## Conceitos
 
@@ -371,9 +371,31 @@ As tarefas rodam como SYSTEM na pasta `\DBBackup\` do Agendador, com o nome
 instância só altera as próprias tarefas (marca de dono na descrição); uma
 tarefa de outra configuração com o mesmo nome causa conflito. Há agenda diária,
 semanal e mensal (DaysOfMonth 1..31 ou Last). Sem `Schedule`, a agenda é
-ignorada; `Tasks` vazio remove somente as tarefas próprias. Tarefas da mesma
-instância em horários sobrepostos disputam o lock (código 3); agrupe os jobs na
-mesma tarefa.
+ignorada; `Tasks` vazio remove somente as tarefas próprias.
+
+**Execuções que se sobrepõem.** Uma instância roda um backup por vez, e o lock
+é `Runtime\DBBackup.lock`. Se uma tarefa dispara enquanto outra execução da
+mesma instância ainda roda, ela **espera a vez** em vez de desistir. Isso vale
+para outra tarefa, para um disparo da mesma tarefa e para um backup manual.
+
+- A espera tem limite: `Execution.LockWaitMinutes` no `ambiente.psd1`, padrão
+  180 min (0 = não espera).
+- O log de quem espera registra quem está rodando (`Aguardando a execucao …
+  (jobs …, modo …, iniciada HH:mm) terminar`, lido de
+  `Runtime\DBBackup.lock.json`) e quanto esperou (`Lock obtido apos N min`).
+- O prazo da execução (`RunTimeoutSeconds`) só começa quando ela consegue o
+  lock.
+- Se o limite estourar, a execução termina com `RESULTADO: FALHA (exit 3)` e
+  publica a tentativa como falha de cada job, o que dispara o BKP-110.
+- Duas tarefas da instância **não podem disparar no mesmo minuto**: a ordem
+  seria aleatória. A validação recusa, e a mensagem sugere juntar os jobs ou
+  atrasar uma delas 1 minuto. O setup já faz esse +1 min sozinho.
+- O limite da tarefa no Agendador inclui a espera:
+  `ceil((RunTimeoutSeconds + LockWaitMinutes × 60) / 3600) + 1` horas, 15 h por
+  padrão. As tarefas usam "executar em paralelo" (`Parallel`); a fila fica com
+  o DBBackup.
+- A atualização (opção 8) também considera ocupada a instância com execução
+  aguardando.
 
 ## Execução e interpretação
 
@@ -405,7 +427,7 @@ RESULTADO: ATENCAO (exit 4) - etapas auxiliares com falha: envio do log
 | 0 | Jobs, reenvios e manutenção concluídos. |
 | 1 | Falha de job, publicação, criptografia ou verificação. |
 | 2 | Configuração, dependência ou inicialização inválida. |
-| 3 | Lock ocupado (outra execução da instância); não gera log nem métrica. |
+| 3 | Outra execução da instância ocupou o lock além de `LockWaitMinutes`; nenhum job executado, log com `RESULTADO: FALHA (exit 3)` e tentativa com falha nas métricas. |
 | 4 | Backups publicados, mas uma etapa auxiliar falhou: retenção, limpeza de execução interrompida, envio do log ou métricas. |
 | 5 | Fallback MySQL publicado como degradado. |
 
