@@ -53,13 +53,42 @@ function New-DBLogPath {
     <# Logs\<instance>\yyyy-MM-dd_HH-mm-ss.log in local time; -2, -3... if taken. #>
     param([string] $LogRoot)
     $stamp = [DateTime]::Now.ToString('yyyy-MM-dd_HH-mm-ss', [Globalization.CultureInfo]::InvariantCulture)
-    $path = Join-Path $LogRoot "$stamp.log"
-    for ($n = 2; (Test-Path -LiteralPath $path) -and $n -lt 1000; $n++) { $path = Join-Path $LogRoot "$stamp-$n.log" }
-    return $path
+    # The file is created here (CreateNew), so two runs starting in the same
+    # second (one waiting for the other) never share a log.
+    for ($n = 1; $n -lt 1000; $n++) {
+        $path = if ($n -eq 1) { Join-Path $LogRoot "$stamp.log" } else { Join-Path $LogRoot "$stamp-$n.log" }
+        try { [IO.File]::Open($path, 'CreateNew', 'Write', 'ReadWrite').Dispose(); return $path }
+        catch [IO.IOException] { if (-not (Test-Path -LiteralPath $path)) { throw } }
+    }
+    throw 'Could not allocate a unique log name.'
+}
+
+function Read-DBLockHolder {
+    <# Who holds the instance lock (DBBackup.lock.json, written by the holder); $null when unknown. #>
+    param([string] $RuntimeRoot)
+    $path = Join-Path $RuntimeRoot 'DBBackup.lock.json'
+    try { if (Test-Path -LiteralPath $path -PathType Leaf) { return Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json } }
+    catch { Write-Verbose "Lock holder unreadable: $($_.Exception.Message)" }
+    return $null
+}
+
+function Format-DBLockHolder {
+    param($Holder)
+    if ($null -eq $Holder) { return 'outra execucao desta instancia' }
+    $started = try { ([DateTime] $Holder.StartedAt).ToString('HH:mm') } catch { '?' }
+    return "a execucao $($Holder.RunId) (jobs $(@($Holder.Jobs) -join ', '), modo $($Holder.Mode), iniciada $started)"
 }
 
 function New-DBRuntime {
-    param([Collections.IDictionary] $Configuration)
+    <#
+    Takes the instance lock. When another run holds it, waits up to
+    LockWaitSeconds (polling every PollSeconds) and logs the wait in this
+    run's log. Returns the runtime, or an object with Busy = $true and the log
+    path when the lock was not obtained in time. While waiting, the run holds
+    Runtime\DBBackup.wait.<id> open, so the updater sees it as running.
+    #>
+    param([Collections.IDictionary] $Configuration, [double] $LockWaitSeconds = 0, [double] $PollSeconds = 30,
+        [string[]] $Jobs = @(), [string] $Mode = 'Full')
     # Runtime holds plaintext work and pending bundles: private. Completed
     # (encrypted bundles) and Logs (sanitized) are operator folders and keep
     # the permissions inherited from the installation.
@@ -67,19 +96,45 @@ function New-DBRuntime {
     foreach ($path in @($Configuration.Paths.CompletedRoot, $Configuration.Paths.LogRoot)) { $null = New-Item -ItemType Directory -Path $path -Force }
     $runtime = $Configuration.Paths.RuntimeRoot
     foreach ($name in @('Pending', 'Work', 'Staging')) { Set-DBPrivateDirectory (Join-Path $runtime $name) }
-    try {
-        $lock = [IO.File]::Open((Join-Path $runtime 'DBBackup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-    }
-    catch [IO.IOException] { return $null }
     $id = [guid]::NewGuid().ToString('N')
+    $logPath = New-DBLogPath $Configuration.Paths.LogRoot
+    $lockPath = Join-Path $runtime 'DBBackup.lock'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lock = $null
+    $wait = $null
+    $waitPath = Join-Path $runtime "DBBackup.wait.$id"
+    try {
+        while ($null -eq $lock) {
+            try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+            catch [IO.IOException] {
+                $holder = Read-DBLockHolder $runtime
+                if ($watch.Elapsed.TotalSeconds -ge $LockWaitSeconds) {
+                    if ($LockWaitSeconds -gt 0) { Write-DBLog $logPath 'Lock' "Desistindo: $(Format-DBLockHolder $holder) ocupou a instancia por mais de $([Math]::Round($LockWaitSeconds / 60)) min (Execution.LockWaitMinutes)." 'ERROR' }
+                    return [pscustomobject]@{ Busy = $true; LogPath = $logPath; Holder = $holder; WaitedSeconds = $watch.Elapsed.TotalSeconds }
+                }
+                if ($null -eq $wait) {
+                    $wait = [IO.File]::Open($waitPath, 'OpenOrCreate', 'ReadWrite', 'None')
+                    Write-DBLog $logPath 'Lock' "Aguardando $(Format-DBLockHolder $holder) terminar (jobs desta execucao: $($Jobs -join ', '); espera maxima $([Math]::Round($LockWaitSeconds / 60)) min)." 'WARN'
+                }
+                Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Max(1, $LockWaitSeconds - $watch.Elapsed.TotalSeconds)))
+            }
+        }
+        if ($null -ne $wait) { Write-DBLog $logPath 'Lock' "Lock obtido apos $([Math]::Round($watch.Elapsed.TotalMinutes)) min de espera." }
+    }
+    finally {
+        if ($null -ne $wait) { $wait.Dispose(); Remove-Item -LiteralPath $waitPath -Force -ErrorAction SilentlyContinue }
+    }
     $work = Join-Path $runtime "Work/$id"
     try {
+        # Holder description for runs that wait (the lock itself cannot be read).
+        @{ RunId = $id; Jobs = @($Jobs); Mode = $Mode; StartedAt = [DateTime]::Now.ToString('o'); ProcessId = $PID } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runtime 'DBBackup.lock.json') -Encoding utf8
         Set-DBPrivateDirectory $work
         return [pscustomobject]@{
-            RunId = $id; Lock = $lock; Work = $work
+            Busy = $false; RunId = $id; Lock = $lock; Work = $work
             Pending = Join-Path $runtime 'Pending'; Staging = Join-Path $runtime 'Staging'
             Completed = $Configuration.Paths.CompletedRoot
-            LogPath = New-DBLogPath $Configuration.Paths.LogRoot
+            LogPath = $logPath; WaitedSeconds = $watch.Elapsed.TotalSeconds
         }
     }
     catch { $lock.Dispose(); throw }
@@ -140,7 +195,11 @@ function Close-DBRuntime {
             Remove-Item -LiteralPath $Runtime.Work -Recurse -Force -ErrorAction Stop
         }
     }
-    finally { $Runtime.Lock.Dispose() }
+    finally {
+        $holder = Join-Path (Split-Path -Parent (Split-Path -Parent $Runtime.Work)) 'DBBackup.lock.json'
+        Remove-Item -LiteralPath $holder -Force -ErrorAction SilentlyContinue
+        $Runtime.Lock.Dispose()
+    }
 }
 
-Export-ModuleMember -Function Set-DBConsoleLog, Protect-DBMessage, Test-DBPrivateAccess, Set-DBPrivateDirectory, New-DBRuntime, Write-DBLog, Clear-DBStaleRuntime, Close-DBRuntime
+Export-ModuleMember -Function Read-DBLockHolder, Set-DBConsoleLog, Protect-DBMessage, Test-DBPrivateAccess, Set-DBPrivateDirectory, New-DBRuntime, Write-DBLog, Clear-DBStaleRuntime, Close-DBRuntime

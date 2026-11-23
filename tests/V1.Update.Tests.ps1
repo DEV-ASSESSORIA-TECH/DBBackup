@@ -118,6 +118,15 @@ Describe 'DBBackup updater (DBBackup.bat, opcao 8)' {
         @(Get-DBRunningInstance $root) | Should -BeNullOrEmpty
     }
 
+    It 'treats a run waiting for the instance lock as running' {
+        . $script:Updater
+        $root = New-TestInstallation 'waiting'
+        $wait = [IO.File]::Open((Join-Path $root "Instances/acme/Runtime/DBBackup.wait.$('a' * 32)"), 'OpenOrCreate', 'ReadWrite', 'None')
+        try { @(Get-DBRunningInstance $root) | Should -Be @('acme') }
+        finally { $wait.Dispose() }
+        @(Get-DBRunningInstance $root) | Should -BeNullOrEmpty
+    }
+
     It 'restores the previous version when the replacement fails' {
         . $script:Updater
         $root = New-TestInstallation 'rollback'

@@ -22,11 +22,15 @@ Describe 'DBBackup task identity and reconciliation' {
         $definition=New-TestDefinition $script:C
         $definition.Arguments | Should -Match '-ConfigPath "C:\\DBBackup\\Instances\\MySQL\\config.psd1" -Job database'
         $definition.Xml | Should -Match 'S-1-5-18'
-        $definition.Xml | Should -Match 'PT12H'
-        Get-DBTaskExecutionLimit $script:C | Should -Be 12
+        $definition.Xml | Should -Match 'PT15H'
+        $definition.Xml | Should -Match '<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>'
+        Get-DBTaskExecutionLimit $script:C | Should -Be 15
         $script:C.Execution=@{RunTimeoutSeconds=72000}
+        # 20 h deadline + 180 min of lock wait (default) + 1 h.
+        Get-DBTaskExecutionLimit $script:C | Should -Be 24
+        (Get-TestPlan $script:C)[0].Definition.Xml | Should -Match 'PT24H'
+        $script:C.Execution.LockWaitMinutes=0
         Get-DBTaskExecutionLimit $script:C | Should -Be 21
-        (Get-TestPlan $script:C)[0].Definition.Xml | Should -Match 'PT21H'
         $definition.Xml | Should -Not -Match 'Seven|Fiscal|-Mode'
         Get-DBTaskFolder | Should -Be '\DBBackup\'
         $definition.Name | Should -Be 'MySQL-daily'
@@ -377,5 +381,19 @@ Describe 'Apply, diagnostics and summary' {
         $text | Should -Match 'Destinatarios age: 2'
         $text | Should -Match '\\DBBackup\\assessoria-database-daily - Daily 19:00, jobs database \(registrada\)'
         $text | Should -Match '-All'
+    }
+}
+
+Describe 'Setup schedule grouping' {
+    BeforeAll { Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'src/App/Modules/Core/Setup.psm1') -Force }
+    It 'moves a time already used by another task one minute later' {
+        $data = @{ InstanceName = 'acme'; Schedule = @{ Tasks = @() } }
+        Add-DBScheduledJob $data 'database' @('12:00', '19:00')
+        Add-DBScheduledJob $data 'fiscal' @('12:00', '18:30')
+        Add-DBScheduledJob $data 'outro' @('12:00', '19:00')
+        $tasks = @($data.Schedule.Tasks)
+        $tasks.Count | Should -Be 2
+        @($tasks[0].Jobs) | Should -Be @('database', 'outro')
+        @($tasks[1].At) | Should -Be @('12:01', '18:30')
     }
 }

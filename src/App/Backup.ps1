@@ -40,7 +40,7 @@ if (-not $ConfigPath) { Write-Error 'Informe -ConfigPath.' -ErrorAction Continue
 if ([bool] $Job -eq [bool] $All) { Write-Error 'Informe -Job <id[,id]> ou -All.' -ErrorAction Continue; exit 2 }
 $code = Invoke-DBBackup -ConfigPath $ConfigPath -Job $Job -All:$All -Mode $Mode
 if ($Interactive) {
-    $meaning = switch ($code) { 0 { 'sucesso' } 1 { 'falha' } 2 { 'erro de configuracao' } 3 { 'outra execucao desta instancia ja esta em andamento' } 4 { 'backup feito, etapa auxiliar com falha' } 5 { 'backup degradado' } default { 'falha' } }
+    $meaning = switch ($code) { 0 { 'sucesso' } 1 { 'falha' } 2 { 'erro de configuracao' } 3 { 'outra execucao desta instancia ocupou a instancia alem do tempo de espera (Execution.LockWaitMinutes)' } 4 { 'backup feito, etapa auxiliar com falha' } 5 { 'backup degradado' } default { 'falha' } }
     "`nResultado: $meaning (exit $code)." | Out-Host
 }
 exit $code

@@ -103,18 +103,22 @@ function Expand-DBUpdatePackage {
 function Get-DBRunningInstance {
     <#
     Instances whose backup is running now: a run holds Runtime\DBBackup.lock
-    open without sharing. An absent lock file means no run.
+    open without sharing, and a run waiting for it holds DBBackup.wait.<id>.
+    An absent lock file means no run.
     #>
     param([Parameter(Mandatory)][string] $InstallRoot)
     $instances = Join-Path $InstallRoot 'Instances'
     if (-not (Test-Path -LiteralPath $instances -PathType Container)) { return @() }
     $busy = @()
     foreach ($directory in @(Get-ChildItem -LiteralPath $instances -Directory -Force)) {
-        $lock = Join-Path $directory.FullName 'Runtime/DBBackup.lock'
-        if (-not (Test-Path -LiteralPath $lock -PathType Leaf)) { continue }
-        try { [IO.File]::Open($lock, 'Open', 'ReadWrite', 'None').Dispose() }
-        catch [IO.FileNotFoundException] { continue }
-        catch [IO.IOException] { $busy += $directory.Name }
+        $runtime = Join-Path $directory.FullName 'Runtime'
+        if (-not (Test-Path -LiteralPath $runtime -PathType Container)) { continue }
+        $files = @(Get-ChildItem -LiteralPath $runtime -File -Force | Where-Object { $_.Name -ceq 'DBBackup.lock' -or $_.Name -cmatch '^DBBackup\.wait\.[a-f0-9]{32}$' })
+        foreach ($file in $files) {
+            try { [IO.File]::Open($file.FullName, 'Open', 'ReadWrite', 'None').Dispose() }
+            catch [IO.FileNotFoundException] { continue }
+            catch [IO.IOException] { $busy += $directory.Name; break }
+        }
     }
     return $busy
 }

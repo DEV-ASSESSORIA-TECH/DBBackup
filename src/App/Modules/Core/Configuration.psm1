@@ -229,7 +229,7 @@ function Read-DBConfiguration {
     $c.Jobs = $jobs
     if (-not $c.Contains('Execution')) { $c.Execution = @{} }
     if ($c.Execution -isnot [Collections.IDictionary]) { throw 'Execution must be a hashtable.' }
-    $defaults = @{ToolTimeoutSeconds=21600;RunTimeoutSeconds=39600;ReserveBytes=1073741824;EstimatedDatabaseBytes=0}
+    $defaults = @{ToolTimeoutSeconds=21600;RunTimeoutSeconds=39600;ReserveBytes=1073741824;EstimatedDatabaseBytes=0;LockWaitMinutes=180}
     foreach ($key in $defaults.Keys) {
         if (-not $c.Execution.Contains($key)) { $c.Execution[$key] = $defaults[$key] }
         [long] $number = 0
@@ -242,6 +242,8 @@ function Read-DBConfiguration {
     # failure and cleans up instead of being killed by the Task Scheduler.
     $runTimeout = [long] $c.Execution.RunTimeoutSeconds
     if ($runTimeout -lt 600 -or $runTimeout -gt 255600) { throw 'RunTimeoutSeconds must be 600..255600.' }
+    # How long a run waits for another run of the instance to finish (0 = do not wait).
+    if ([long] $c.Execution.LockWaitMinutes -gt 1440) { throw 'LockWaitMinutes must be 0..1440.' }
     if (-not $c.Contains('Monitoring')) { $c.Monitoring = @{Enabled=$false} }
     if ($c.Monitoring -isnot [Collections.IDictionary] -or -not $c.Monitoring.Contains('Enabled') -or $c.Monitoring.Enabled -isnot [bool]) { throw 'Monitoring.Enabled must be boolean.' }
     if ($c.Monitoring.Enabled) {

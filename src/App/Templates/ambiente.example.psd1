@@ -15,7 +15,8 @@
         # Pasta com dbbackup.exe e dbping.exe (...\Tools ou ...\Bin64):
         # SqlAnywhere = 'C:\Program Files\SQL Anywhere 17\Tools'
     }
-    Execution = @{ ToolTimeoutSeconds = 21600; RunTimeoutSeconds = 39600; ReserveBytes = 1073741824; EstimatedDatabaseBytes = 0 }
+    # LockWaitMinutes: quanto uma execucao espera outra da mesma instancia terminar (0 = nao espera).
+    Execution = @{ ToolTimeoutSeconds = 21600; RunTimeoutSeconds = 39600; ReserveBytes = 1073741824; EstimatedDatabaseBytes = 0; LockWaitMinutes = 180 }
     Archive = @{ CompressionLevel = 5; CpuLimitPercent = 50 }
     Retention = @{ CompletedDays = 7; LogDays = 30; KeepLocalPayload = $true }
     # Site: label site das metricas (local do servidor); o setup pergunta.

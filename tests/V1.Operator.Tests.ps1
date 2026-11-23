@@ -28,9 +28,9 @@ Describe 'Several times per scheduled task' {
         Get-DBScheduleNextRun -Tasks @($task) -Job fiscal -After ([datetime] '2026-11-18T13:00:00') | Should -Be ([datetime] '2026-11-18T19:00:00')
         Get-DBScheduleMaxGap -Tasks @($task) -Job Database | Should -Be 17.5
     }
-    It 'warns about overlapping times and rejects repeated or invalid times' {
-        $tasks = @(Get-DBScheduleTask (New-TaskConfig @(@{ Name = 'a'; Jobs = @('Database'); At = @('12:30', '19:00') }, @{ Name = 'b'; Jobs = @('fiscal'); At = '19:00' })))
-        @(Get-DBScheduleWarning $tasks) | Should -Match '19:00.*a, b'
+    It 'rejects tasks in the same minute and repeated or invalid times' {
+        { Get-DBScheduleTask (New-TaskConfig @(@{ Name = 'a'; Jobs = @('Database'); At = @('12:30', '19:00') }, @{ Name = 'b'; Jobs = @('fiscal'); At = '19:00' })) } | Should -Throw "*'a' e 'b'*mesmo horario (19:00)*"
+        @(Get-DBScheduleTask (New-TaskConfig @(@{ Name = 'a'; Jobs = @('Database'); At = @('12:30', '19:00') }, @{ Name = 'b'; Jobs = @('fiscal'); At = '19:01' }))).Count | Should -Be 2
         { Get-DBScheduleTask (New-TaskConfig @(@{ Name = 'a'; Jobs = @('Database'); At = @('19:00', '19:00') })) } | Should -Throw '*repete um horario*'
         { Get-DBScheduleTask (New-TaskConfig @(@{ Name = 'a'; Jobs = @('Database'); At = @('12:30', '7:00') })) } | Should -Throw "*horario '7:00'*"
     }
@@ -51,7 +51,8 @@ Describe 'Several times per scheduled task' {
         @($data.Schedule.Tasks[0].Jobs) | Should -Be @('Database', 'fiscal')
         @($data.Schedule.Tasks[0].At) | Should -Be @('12:30', '19:00')
         $data.Schedule.Tasks[1].At | Should -BeOfType [string]
-        $data.Schedule.Tasks[1].Name | Should -Be 'diario-1900'
+        # 19:00 is taken by the first task: one minute later, so it waits for it.
+        $data.Schedule.Tasks[1].Name | Should -Be 'diario-1901'
     }
 }
 

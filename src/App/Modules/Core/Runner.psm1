@@ -21,7 +21,7 @@ function Write-DBRunResult {
     line in the file is the final one.
     #>
     param([string] $LogPath, [int] $ExitCode, [string[]] $FailedJobs = @(), [string[]] $DegradedJobs = @(), [string[]] $Auxiliary = @(), [string] $Reason)
-    $label = switch ($ExitCode) { 0 { 'SUCESSO' } 1 { 'FALHA' } 2 { 'ERRO DE CONFIGURACAO' } 4 { 'ATENCAO' } 5 { 'DEGRADADO' } default { 'FALHA' } }
+    $label = switch ($ExitCode) { 0 { 'SUCESSO' } 1 { 'FALHA' } 2 { 'ERRO DE CONFIGURACAO' } 3 { 'FALHA' } 4 { 'ATENCAO' } 5 { 'DEGRADADO' } default { 'FALHA' } }
     $details = @()
     if ($FailedJobs.Count) { $details += "jobs com falha: $(@($FailedJobs | Select-Object -Unique) -join ', ')" }
     if ($DegradedJobs.Count) { $details += "jobs degradados: $(@($DegradedJobs | Select-Object -Unique) -join ', ')" }
@@ -36,6 +36,7 @@ function Write-DBRunResult {
 function Invoke-DBBackup {
     <#
     Exit codes (precedence 1 > 5 > 4 > 0): 1 a job or pending upload failed;
+    3 another run of the instance held the lock longer than LockWaitMinutes;
     5 every job published, at least one degraded; 4 backups published but an
     auxiliary step failed (retention, interrupted-run cleanup, log upload or
     monitoring textfile); 0 success. 2 configuration/dependency; 3 lock busy.
@@ -76,8 +77,16 @@ function Invoke-DBBackup {
     $degradedJobs = [Collections.Generic.List[string]]::new()
     $auxiliary = [Collections.Generic.List[string]]::new()
     try {
-        $runtime = New-DBRuntime $c
-        if ($null -eq $runtime) { return 3 }
+        # Another run of this instance (overlapping task, manual run): wait for it.
+        $runtime = New-DBRuntime $c -LockWaitSeconds ([double] $c.Execution.LockWaitMinutes * 60) -Jobs @($jobs | ForEach-Object Id) -Mode $Mode
+        if ($runtime.Busy) {
+            # Not silent: the log says who held the instance and every job reports a failed attempt.
+            $reason = "a instancia ficou ocupada por mais de $($c.Execution.LockWaitMinutes) min; nenhum job executado"
+            Write-DBRunResult $runtime.LogPath 3 @($jobs | ForEach-Object Id) -Reason $reason
+            foreach ($j in $jobs) { $null = Publish-DBJobMonitoring -Configuration $c -Job $j -Status FAILED -DurationSeconds $runtime.WaitedSeconds -LogPath $runtime.LogPath -Mode $Mode }
+            $runtime = $null
+            return 3
+        }
         Write-DBLog $runtime.LogPath 'Startup' "DBBackup instance $($c.InstanceName); run $($runtime.RunId); mode $Mode."
         # The deadline covers every native tool of the run, retries included.
         $deadline = [DateTime]::UtcNow.AddSeconds([double] $c.Execution.RunTimeoutSeconds)

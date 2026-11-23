@@ -104,7 +104,39 @@ function Get-DBScheduleTask {
         $registered = Get-DBTaskRegisteredName -InstanceName $Configuration.InstanceName -TaskName $entry.Name
         $result += [pscustomobject]@{Name=$entry.Name;RegisteredName=$registered;Jobs=$taskJobs;At=$times;Frequency=$frequency;Days=$days;DaysOfMonth=$monthDays;Enabled=$enabled;Mode=$mode}
     }
+    Assert-DBDistinctTrigger $result
     return $result
+}
+
+function Test-DBTaskDaysOverlap {
+    <# True when two tasks can fire on the same day (conservative for Weekly x Monthly and Last). #>
+    param($First, $Second)
+    if ($First.Frequency -eq 'Daily' -or $Second.Frequency -eq 'Daily') { return $true }
+    if ($First.Frequency -ne $Second.Frequency) { return $true }
+    if ($First.Frequency -eq 'Weekly') { return [bool] @($First.Days | Where-Object { $_ -in $Second.Days }).Count }
+    $a = @($First.DaysOfMonth | ForEach-Object { [string] $_ })
+    $b = @($Second.DaysOfMonth | ForEach-Object { [string] $_ })
+    if (@($a | Where-Object { $_ -in $b }).Count) { return $true }
+    $late = @('28','29','30','31')
+    return (('Last' -in $a -and @($b | Where-Object { $_ -in $late }).Count) -or ('Last' -in $b -and @($a | Where-Object { $_ -in $late }).Count))
+}
+
+function Assert-DBDistinctTrigger {
+    <#
+    Two enabled tasks of one instance must not fire in the same minute: the
+    order would be random. Overlaps are fine (the later run waits for the
+    lock); one minute apart is enough to make the order deterministic.
+    #>
+    param([object[]] $Tasks)
+    $enabled = @($Tasks | Where-Object Enabled)
+    for ($i = 0; $i -lt $enabled.Count; $i++) {
+        for ($k = $i + 1; $k -lt $enabled.Count; $k++) {
+            $shared = @($enabled[$i].At | Where-Object { $_ -in $enabled[$k].At })
+            if (-not $shared.Count -or -not (Test-DBTaskDaysOverlap $enabled[$i] $enabled[$k])) { continue }
+            $later = [DateTime]::ParseExact($shared[0], 'HH:mm', [Globalization.CultureInfo]::InvariantCulture).AddMinutes(1).ToString('HH:mm')
+            throw "Tarefas '$($enabled[$i].Name)' e '$($enabled[$k].Name)' disparam no mesmo horario ($($shared -join ', ')). Junte os jobs numa tarefa ou atrase uma delas 1 minuto (ex.: '$later'): a segunda espera a primeira terminar."
+        }
+    }
 }
 
 function Get-DBTaskMode {
@@ -189,20 +221,6 @@ function Get-DBScheduleNextRun {
     return $next
 }
 
-function Get-DBScheduleWarning {
-    [CmdletBinding()]
-    [OutputType([string[]])]
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Tasks)
-
-    $warnings = @()
-    $starts = @(foreach ($task in @($Tasks | Where-Object Enabled)) { foreach ($time in @($task.At)) { [pscustomobject]@{ At = $time; Name = $task.Name } } })
-    foreach ($group in @($starts | Group-Object At | Where-Object Count -gt 1)) {
-        $warnings += "Tarefas no mesmo horario ($($group.Name)): $(($group.Group.Name) -join ', '). So uma roda; as outras terminam com exit code 3."
-    }
-    return $warnings
-}
-
-
 function Get-DBTaskDefinition {
     [CmdletBinding()]
     param(
@@ -211,7 +229,7 @@ function Get-DBTaskDefinition {
         [Parameter(Mandatory)][string] $ScriptPath,
         [Parameter(Mandatory)][string] $WorkingDirectory,
         [Parameter(Mandatory)][string] $ConfigPath,
-        [ValidateRange(1, 72)][int] $ExecutionLimitHours = 12
+        [ValidateRange(1, 100)][int] $ExecutionLimitHours = 15
     )
 
     $arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" -ConfigPath `"$ConfigPath`" -Job $(@($Task.Jobs) -join ',')$(if ((Get-DBTaskMode $Task) -eq 'Incremental') { ' -Mode Incremental' })"
@@ -249,7 +267,7 @@ $triggers
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
@@ -295,15 +313,19 @@ $body
 
 function Get-DBTaskExecutionLimit {
     <#
-    Scheduler hard stop: the run deadline (Execution.RunTimeoutSeconds) rounded
-    up to whole hours plus one hour, so DBBackup reaches its own deadline first,
-    publishes the failure, uploads its log and removes plaintext Work.
+    Scheduler hard stop: the lock wait (Execution.LockWaitMinutes) plus the run
+    deadline (Execution.RunTimeoutSeconds), rounded up to whole hours plus one
+    hour, so DBBackup reaches its own deadline first, publishes the failure,
+    uploads its log and removes plaintext Work.
     #>
     param([Collections.IDictionary] $Configuration)
     $seconds = 39600
-    if ($Configuration.Contains('Execution') -and $Configuration.Execution -is [Collections.IDictionary] -and $Configuration.Execution.Contains('RunTimeoutSeconds')) {
-        $seconds = [long] $Configuration.Execution.RunTimeoutSeconds
+    $wait = 180
+    if ($Configuration.Contains('Execution') -and $Configuration.Execution -is [Collections.IDictionary]) {
+        if ($Configuration.Execution.Contains('RunTimeoutSeconds')) { $seconds = [long] $Configuration.Execution.RunTimeoutSeconds }
+        if ($Configuration.Execution.Contains('LockWaitMinutes')) { $wait = [long] $Configuration.Execution.LockWaitMinutes }
     }
+    $seconds += $wait * 60
     return [int] ([Math]::Ceiling($seconds / 3600.0) + 1)
 }
 
@@ -479,4 +501,4 @@ function Remove-DBLegacyTask {
     }
 }
 
-Export-ModuleMember -Function Get-DBTaskOwner, Get-DBTaskFolder, Get-DBTaskRegisteredName, Get-DBScheduleTask, Get-DBTaskDefinition, Get-DBSchedulePlan, ConvertTo-DBSchedulerFolderPath, Get-DBSchedulerSnapshot, Invoke-DBSchedulePlan, Get-DBScheduleWarning, Get-DBScheduleMaxGap, Get-DBScheduleNextRun, Get-DBTaskExecutionLimit, Get-DBLegacyTask, Remove-DBLegacyTask
+Export-ModuleMember -Function Get-DBTaskOwner, Get-DBTaskFolder, Get-DBTaskRegisteredName, Get-DBScheduleTask, Get-DBTaskDefinition, Get-DBSchedulePlan, ConvertTo-DBSchedulerFolderPath, Get-DBSchedulerSnapshot, Invoke-DBSchedulePlan, Get-DBScheduleMaxGap, Get-DBScheduleNextRun, Get-DBTaskExecutionLimit, Get-DBLegacyTask, Remove-DBLegacyTask
