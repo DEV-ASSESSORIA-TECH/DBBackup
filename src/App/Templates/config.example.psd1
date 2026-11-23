@@ -17,6 +17,12 @@
     # @{ Id = 'documentos'; Provider = 'Directory'; SourcePath = 'D:\Documentos'; RemoteRoot = 's3:bucket/ASSESSORIA' }
     Jobs = @()
     Storage = @{ ConfigPath = 'Secrets/rclone.conf'; Destination = 's3' }
+    # Tags de retencao no S3 (opcional; sem Tagging nada recebe tag). Cada completo
+    # recebe <Key>=<Default>, exceto o primeiro do periodo de uma tag especial
+    # ativada (anual > mensal > semanal > diario), que recebe essa tag. Incrementais
+    # e logs nao recebem tag. Jobs omitido = todos. Exige s3:PutObjectTagging.
+    # Storage = @{ ConfigPath = 'Secrets/rclone.conf'; Destination = 's3'
+    #     Tagging = @{ Key = 'retencao'; Default = 'padrao'; Special = @('mensal'); Jobs = @('dominio') } }
     Encryption = @{ RecipientsFile = 'Secrets/recipients.txt' }
     # Paths omitido: Runtime fica na instancia; Completed e Logs em
     # <raiz>\Completed\<instancia> e <raiz>\Logs\<instancia>.

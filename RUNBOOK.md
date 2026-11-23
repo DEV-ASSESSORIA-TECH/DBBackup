@@ -1,4 +1,4 @@
-# DBBackup — runbook v2.2.4
+# DBBackup — runbook v2.3.0
 
 ## Conceitos
 
@@ -525,9 +525,60 @@ aws s3api put-bucket-lifecycle-configuration --bucket <bucket-dominio> --lifecyc
 - Com versionamento ou Object Lock no bucket, use também
   `NoncurrentVersionExpiration`.
 - O lifecycle só filtra por prefixo, tag e tamanho. Ele não sabe escolher "o
-  primeiro completo do mês". Para guardar uma cópia mensal por mais tempo, ela
-  precisa estar num prefixo próprio (por exemplo `<job>/mensal/`), com uma
-  regra própria.
+  primeiro completo do mês" e também não aceita "objeto **sem** tal tag". Quando
+  duas regras de expiração caem no mesmo objeto, vale a mais curta. Por isso as
+  cópias especiais usam tags, e o completo comum também leva uma tag (abaixo).
+
+### Tags de retenção (opcional)
+
+Para guardar cópias especiais (diária, semanal, mensal ou anual) por mais tempo,
+ative `Storage.Tagging` na instância (opção 2 do menu). Sem esse bloco, nenhum
+objeto recebe tag.
+
+```powershell
+Storage = @{
+    ConfigPath = 'Secrets/rclone.conf'
+    Destination = 's3'
+    Tagging = @{ Key = 'retencao'; Default = 'padrao'; Special = @('mensal'); Jobs = @('Database') }
+}
+```
+
+- Todo **completo** de um job com tag sobe com `retencao=padrao`, exceto o
+  primeiro completo de um período especial ativado, que sobe com a tag desse
+  período. A prioridade é `anual` > `mensal` > `semanal` > `diario`. O completo
+  que recebe `anual` também conta como o mensal, semanal e diário daquele
+  momento.
+- Um período só é dado como coberto depois que o objeto especial é confirmado
+  no S3 (`Runtime\Tagging\<job>.json`). Se o envio falhar, o completo seguinte
+  também recebe a tag especial: no máximo sobram duas cópias, nunca nenhuma.
+- **Incrementais e logs não recebem tag.** Eles continuam só nas regras por
+  prefixo.
+- Opções: `Key` (padrão `retencao`), `Default` (padrão `padrao`), `Special`
+  (qualquer combinação de `diario`, `semanal`, `mensal` e `anual`; vazio = só
+  `padrao`), `Jobs` (omitido = todos) e `Enabled`. A semana é a semana ISO e as
+  datas são locais.
+- Exige `s3:PutObjectTagging` no IAM. A tag fica no `state.json`, no
+  `manifest.json` (`RetentionTag`) e no log (`Retention tag: retencao=mensal`).
+  Para guardar por mais tempo um completo comum já enviado, troque a tag dele no
+  console S3.
+
+Regras de lifecycle com tags (ajuste os dias). Cada regra de completo combina
+o prefixo com a tag:
+
+```json
+{ "ID": "database-padrao-30d", "Status": "Enabled",
+  "Filter": { "And": { "Prefix": "ASSESSORIA/Database/2", "Tags": [ { "Key": "retencao", "Value": "padrao" } ] } },
+  "Expiration": { "Days": 30 } },
+{ "ID": "database-mensal-365d", "Status": "Enabled",
+  "Filter": { "And": { "Prefix": "ASSESSORIA/Database/2", "Tags": [ { "Key": "retencao", "Value": "mensal" } ] } },
+  "Expiration": { "Days": 365 } }
+```
+
+Não deixe uma regra só por prefixo (`ASSESSORIA/Database/2` sem tag) junto com
+as regras de tag: ela apagaria também as cópias especiais. Um objeto sem tag (de
+antes de ativar as tags, ou de um envio em que a tag não pôde ser decidida, o
+que aparece como `WARN` no log) não entra em nenhuma regra de completo e fica
+guardado até você tratá-lo.
 
 ### Monitoramento
 

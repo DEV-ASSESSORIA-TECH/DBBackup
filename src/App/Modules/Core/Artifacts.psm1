@@ -1,5 +1,5 @@
 Set-StrictMode -Version Latest
-foreach ($module in @('Archive', 'Storage', 'Encryption', 'Runtime', 'Configuration', 'Capacity', 'Observation')) { Import-Module (Join-Path $PSScriptRoot "$module.psm1") }
+foreach ($module in @('Archive', 'Storage', 'Encryption', 'Runtime', 'Configuration', 'Capacity', 'Observation', 'Tagging')) { Import-Module (Join-Path $PSScriptRoot "$module.psm1") }
 
 function Assert-DBBackupDependency {
     param([Collections.IDictionary] $Configuration, [object[]] $Jobs)
@@ -75,12 +75,21 @@ function Send-DBBundle {
     $md5Property = $s.PSObject.Properties['Md5']
     $md5 = if ($null -ne $md5Property) { [string] $md5Property.Value } else { $null }
     Write-DBLog $Runtime.LogPath $s.Job "Step 4/4: uploading $([Math]::Round([long] $s.SizeBytes / 1MB)) MB to $($s.RemotePath)."
+    # The tag chosen when the bundle was created travels with it (retries keep it).
+    $tagProperty = $s.PSObject.Properties['Tag']
+    $tag = if ($null -ne $tagProperty) { [string] $tagProperty.Value } else { '' }
     $sent = Send-DBBackupFile -RclonePath $Configuration.Tools.Rclone -ConfigPath $Configuration.Storage.ConfigPath -LocalPath (Join-Path $BundlePath $s.FileName) `
-        -RemotePath $s.RemotePath -ExpectedSize ([long] $s.SizeBytes) -ExpectedMd5 $md5 -TimeoutSeconds $Configuration.Execution.ToolTimeoutSeconds
+        -RemotePath $s.RemotePath -ExpectedSize ([long] $s.SizeBytes) -ExpectedMd5 $md5 -TimeoutSeconds $Configuration.Execution.ToolTimeoutSeconds -Tagging $tag
     $level = if ($sent.Verification -eq 'size-only') { 'WARN' } else { 'INFO' }
     Write-DBLog $Runtime.LogPath $s.Job "Uploaded $($s.RemotePath); remote verification: $($sent.Verification)." $level
     $s.Transport = 'CONFIRMED'
     Write-DBJson (Join-Path $BundlePath 'state.json') $s
+    $periodsProperty = $s.PSObject.Properties['TagPeriods']
+    if ($null -ne $periodsProperty -and $null -ne $periodsProperty.Value) {
+        # The special copy of these periods is in S3: the next fulls get the default tag.
+        try { Save-DBTagPeriod -Configuration $Configuration -Job $s.Job -Periods $periodsProperty.Value }
+        catch { Write-DBLog $Runtime.LogPath $s.Job "Tagging state not updated (the next full may also get the special tag): $($_.Exception.Message)" 'WARN' }
+    }
     $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
     # Configuration requires the same volume: never split payload and state
     # with a cross-volume copy/delete when confirming transport.
@@ -120,7 +129,8 @@ function Get-DBArtifactBaseName {
 }
 
 function Publish-DBPackage {
-    param([Collections.IDictionary] $Configuration, $Runtime, $Job, $Result, $Package)
+    <# Tag: retention tag of the run (Get-DBRetentionTag) or $null; recorded in manifest and state. #>
+    param([Collections.IDictionary] $Configuration, $Runtime, $Job, $Result, $Package, $Tag)
     $base = Get-DBArtifactBaseName -Configuration $Configuration -Runtime $Runtime -Job $Job -StartedAtUtc $Result.StartedAtUtc -Role $Package.Role
     $source = [IO.Path]::GetFullPath($Package.SourcePath)
     if (-not (Test-DBPathWithin $source $Runtime.Work)) { throw 'Provider payload is outside run work directory.' }
@@ -162,6 +172,7 @@ function Publish-DBPackage {
         StartedAtUtc = $Result.StartedAtUtc.ToString('o'); FinishedAtUtc = $Result.FinishedAtUtc.ToString('o')
         Metadata = $Result.Metadata; Files = $files; Tools = $versions
         Roles = @($Result.Packages.Role)
+        RetentionTag = $(if ($null -ne $Tag) { "$($Tag.Key)=$($Tag.Value)" } else { $null })
     }
     $payloadBytes = Get-DBDirectorySize $source
     if ($null -ne $contentPath) { $payloadBytes += Get-DBDirectorySize $contentPath }
@@ -209,6 +220,10 @@ function Publish-DBPackage {
             RemotePath = $remote; Transport = 'PENDING'
         }
         if ($Package.Role -ceq 'INCREMENTAL') { $state.BaseRunId = $Result.Metadata.BaseRunId; $state.BaseRecoveryPointUtc = $Result.Metadata.BaseRecoveryPointUtc }
+        if ($null -ne $Tag) {
+            $state.Tag = "$($Tag.Key)=$($Tag.Value)"
+            if ($Tag.Periods.Count) { $state.TagPeriods = $Tag.Periods }
+        }
         Write-DBJson (Join-Path $bundle 'state.json') $state
         $pendingParent = Join-Path $Runtime.Pending $Job.Id
         $null = New-Item -ItemType Directory -Path $pendingParent -Force

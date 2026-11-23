@@ -227,6 +227,26 @@ function Read-DBConfiguration {
     if (-not $c.Storage.Contains('Destination')) { $c.Storage.Destination = 's3' }
     if ([string] $c.Storage.Destination -cnotmatch '^[a-z0-9]+([-_][a-z0-9]+)*$') { throw 'Storage.Destination must be a lowercase identifier.' }
     $c.Jobs = $jobs
+    # Optional retention tags of the S3 objects (Tagging.psm1). Absent = no tags.
+    if ($c.Storage.Contains('Tagging')) {
+        $t = $c.Storage.Tagging
+        if ($t -isnot [Collections.IDictionary]) { throw "Storage.Tagging must be @{ Key = 'retencao'; Default = 'padrao'; Special = @('mensal') }." }
+        foreach ($key in $t.Keys) { if ($key -notin @('Enabled','Key','Default','Special','Jobs')) { throw "Unknown Storage.Tagging key: $key" } }
+        if (-not $t.Contains('Enabled')) { $t.Enabled = $true }
+        if ($t.Enabled -isnot [bool]) { throw 'Storage.Tagging.Enabled must be boolean.' }
+        if (-not $t.Contains('Key')) { $t.Key = 'retencao' }
+        if (-not $t.Contains('Default')) { $t.Default = 'padrao' }
+        foreach ($name in @('Key','Default')) {
+            if ([string] $t[$name] -cnotmatch '^[a-z0-9]+([-_][a-z0-9]+)*$' -or ([string] $t[$name]).Length -gt 64) { throw "Storage.Tagging.$name must be lowercase letters, digits, - or _." }
+        }
+        $periods = @('diario','semanal','mensal','anual')
+        if ([string] $t.Default -cin $periods) { throw "Storage.Tagging.Default cannot be a special value ($($periods -join ', '))." }
+        $t.Special = @(if ($t.Contains('Special')) { @($t.Special | ForEach-Object { [string] $_ }) })
+        foreach ($value in $t.Special) { if ($value -cnotin $periods) { throw "Storage.Tagging.Special accepts $($periods -join ', '); got '$value'." } }
+        if (@($t.Special | Select-Object -Unique).Count -ne $t.Special.Count) { throw 'Storage.Tagging.Special repeats a value.' }
+        $t.Jobs = @(if ($t.Contains('Jobs')) { @($t.Jobs | ForEach-Object { [string] $_ }) })
+        foreach ($id in $t.Jobs) { if ($id -cnotin @($jobs.Id)) { throw "Storage.Tagging.Jobs cites an unknown job: $id" } }
+    }
     if (-not $c.Contains('Execution')) { $c.Execution = @{} }
     if ($c.Execution -isnot [Collections.IDictionary]) { throw 'Execution must be a hashtable.' }
     $defaults = @{ToolTimeoutSeconds=21600;RunTimeoutSeconds=39600;ReserveBytes=1073741824;EstimatedDatabaseBytes=0;LockWaitMinutes=180}

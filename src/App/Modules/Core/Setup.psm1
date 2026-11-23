@@ -817,6 +817,7 @@ function Get-DBSetupSummary {
         "Completed / Logs:  $($Configuration.Paths.CompletedRoot) / $($Configuration.Paths.LogRoot)"
         'Diagnostico local: OK'
         $(if ($Configuration.Monitoring.Enabled) { "Monitoramento:     servico $($Configuration.Monitoring.Service) em $($Configuration.Monitoring.TextfileDirectory)" } else { 'Monitoramento:     desligado (Monitoring.Enabled = $false)' })
+        $(if ($Configuration.Storage.Contains('Tagging') -and $Configuration.Storage.Tagging.Enabled) { $t = $Configuration.Storage.Tagging; "Tags S3:           $($t.Key)=$($t.Default) nos completos; especiais: $(if (@($t.Special).Count) { @($t.Special) -join ', ' } else { 'nenhuma' })$(if (@($t.Jobs).Count) { "; jobs $(@($t.Jobs) -join ', ')" })" } else { 'Tags S3:           nao usadas (Storage.Tagging ausente)' })
     )
     foreach ($job in $Configuration.Jobs) {
         $source = if ($job.Provider -eq 'Directory') { $job.SourcePath } else { "banco $($job.Database)" }
