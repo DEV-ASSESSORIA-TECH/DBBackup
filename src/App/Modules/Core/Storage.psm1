@@ -98,7 +98,9 @@ function Send-DBBackupFile {
         [string] $RemotePath,
         [Nullable[long]] $ExpectedSize,
         [string] $ExpectedMd5,
-        [double] $TimeoutSeconds = 21600
+        [double] $TimeoutSeconds = 21600,
+        # S3 object tag 'key=value' set on upload (needs s3:PutObjectTagging).
+        [string] $Tagging
     )
 
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
@@ -120,13 +122,12 @@ function Send-DBBackupFile {
         $ExpectedMd5 = $digest.Md5
     }
 
-    $copyResult = Invoke-Rclone -RclonePath $RclonePath -TimeoutSeconds $TimeoutSeconds -Arguments @(
-        'copyto'
-        $LocalPath
-        $RemotePath
-        '--config'
-        $ConfigPath
-    )
+    $copyArguments = @('copyto', $LocalPath, $RemotePath, '--config', $ConfigPath)
+    if ($Tagging) {
+        if ($Tagging -cnotmatch '^[a-z0-9]+([-_][a-z0-9]+)*=[a-z0-9]+([-_][a-z0-9]+)*$') { throw "Invalid object tag: $Tagging" }
+        $copyArguments += @('--header-upload', "X-Amz-Tagging: $Tagging")
+    }
+    $copyResult = Invoke-Rclone -RclonePath $RclonePath -TimeoutSeconds $TimeoutSeconds -Arguments $copyArguments
 
     if ($copyResult.ExitCode -ne 0) {
         throw "rclone copyto failed with exit code $($copyResult.ExitCode). $($copyResult.StdErr)"

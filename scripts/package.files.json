@@ -114,5 +114,9 @@
   {
     "source": "src/App/Templates/ambiente.example.psd1",
     "target": "App/Templates/ambiente.example.psd1"
+  },
+  {
+    "source": "src/App/Modules/Core/Tagging.psm1",
+    "target": "App/Modules/Core/Tagging.psm1"
   }
 ]

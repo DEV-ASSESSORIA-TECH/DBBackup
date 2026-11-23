@@ -5,6 +5,7 @@ Import-Module (Join-Path $PSScriptRoot 'Observation.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Capacity.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Process.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Incremental.psm1')
+Import-Module (Join-Path $PSScriptRoot 'Tagging.psm1')
 
 function Get-DBRunExitCode {
     param([bool] $Failed, [bool] $Degraded, [bool] $Maintenance)
@@ -151,10 +152,19 @@ function Invoke-DBBackup {
                     }
                     catch { Write-DBLog $runtime.LogPath $j.Id "Capacity history not updated: $($_.Exception.Message)" 'WARN' }
                 }
+                $tag = $null
+                if ($jobMode -eq 'Full' -and $result.Status -ne 'FAILED') {
+                    try {
+                        $tag = Get-DBRetentionTag -Configuration $c -Job $j -StartedAtUtc $result.StartedAtUtc
+                        if ($null -ne $tag) { Write-DBLog $runtime.LogPath $j.Id "Retention tag: $($tag.Key)=$($tag.Value)." }
+                    }
+                    # Untagged objects never match the default lifecycle rule: kept, not lost.
+                    catch { Write-DBLog $runtime.LogPath $j.Id "Retention tag not decided, object goes untagged: $($_.Exception.Message)" 'WARN' }
+                }
                 $published = 0
                 foreach ($package in $result.Packages) {
                     try {
-                        Publish-DBPackage -Configuration $c -Runtime $runtime -Job $j -Result $result -Package $package
+                        Publish-DBPackage -Configuration $c -Runtime $runtime -Job $j -Result $result -Package $package -Tag $tag
                         $published++
                     }
                     catch { $failed = $true; Write-DBLog $runtime.LogPath $j.Id $_.Exception.Message 'ERROR' }

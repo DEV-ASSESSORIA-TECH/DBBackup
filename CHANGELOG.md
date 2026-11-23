@@ -4,6 +4,24 @@ Todas as alterações relevantes do DBBackup são registradas neste arquivo. O
 projeto usa as versões semânticas definidas em `VERSION` e as principais seções
 do Keep a Changelog, sem exigir todas as seções em cada versão.
 
+## [2.3.0] - 2026-11-23
+
+### Adicionado
+
+- Tags de retenção no S3 (opcional, por instância em `Storage.Tagging`).
+  - Todo completo sobe com `retencao=padrao`. O primeiro completo de um período
+    especial ativado (`diario`, `semanal`, `mensal` ou `anual`; vale o mais
+    longo) sobe com a tag do período.
+  - O período só é dado como coberto depois do envio confirmado.
+  - Incrementais e logs não recebem tag.
+  - A tag fica no `state.json`, no `manifest.json` e no log; o resumo do Apply
+    mostra a configuração.
+  - Sem `Storage.Tagging`, nada muda.
+  - Exige `s3:PutObjectTagging`.
+- RUNBOOK: regras de lifecycle por prefixo + tag. O lifecycle não filtra por
+  ausência de tag e, com duas regras no mesmo objeto, vale a expiração mais
+  curta; por isso o completo comum também recebe tag.
+
 ## [2.2.4] - 2026-11-23
 
 ### Alterado
