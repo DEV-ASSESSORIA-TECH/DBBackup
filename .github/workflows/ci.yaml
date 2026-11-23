@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  # Semanal: contrato alterado no repositorio grafana sem mudanca aqui.
+  schedule:
+    - cron: '23 11 * * 1'
 
 permissions:
   contents: read
@@ -31,6 +34,9 @@ jobs:
 
       - name: Verify DBBackup source and package contracts
         run: ./scripts/verify.ps1
+
+      - name: Check producer against the grafana backup contract (main)
+        run: ./scripts/check-grafana-contract.ps1
 
       - name: Build DBBackup distribution
         run: ./scripts/package.ps1
