@@ -475,27 +475,40 @@ incremental daquele completo.
 ### Retenção
 
 Local (`Completed`): completos e incrementais saem após
-`Retention.CompletedDays` (7). Além disso, quando um completo novo é confirmado,
-os incrementais cuja base é mais antiga que o completo anterior saem. Na
-prática, fica o completo de hoje, o de ontem e os incrementais de hoje
-(feitos sobre o completo de ontem). Se um completo falhar, nada novo é apagado.
+`Retention.CompletedDays` (7). Além disso, a cada completo novo confirmado,
+saem os incrementais cuja base é anterior ao penúltimo completo. Depois do
+completo de hoje às 19:00, ficam os completos dos últimos 7 dias, os
+incrementais de hoje (base: completo de ontem) e os próximos. Os de ontem saem
+nesse momento. Entre a meia-noite e as 19:00, ficam os de ontem e os de hoje.
+Se um completo falhar, nada novo é apagado.
 
 No S3, o DBBackup não apaga nada (IAM sem `DeleteObject`). A retenção é feita
-por regras de lifecycle no bucket, com prefixos separados. Exemplo (30 dias para
-completos e 3 dias para incrementais; ajuste os valores e o prefixo):
+por regras de lifecycle no bucket. Os prefixos separam os tipos:
+
+| Tipo | Caminho no bucket |
+| --- | --- |
+| completos | `<prefixo>/<job>/aaaa/mm/dd/` |
+| incrementais | `<prefixo>/<job>/incremental/aaaa/mm/dd/` |
+| logs das execuções | `<prefixo>/Logs/aaaa/mm/dd/` |
+
+Exemplo para a Domínio do srv-contabil-ass (prefixo `ASSESSORIA`, job
+`Database`; ajuste os dias):
 
 ```json
 {
   "Rules": [
-    { "ID": "dominio-completo-30d", "Status": "Enabled",
-      "Filter": { "Prefix": "ASSESSORIA/dominio/2" },
+    { "ID": "database-completo-30d", "Status": "Enabled",
+      "Filter": { "Prefix": "ASSESSORIA/Database/2" },
       "Expiration": { "Days": 30 } },
-    { "ID": "dominio-incremental-3d", "Status": "Enabled",
-      "Filter": { "Prefix": "ASSESSORIA/dominio/incremental/" },
+    { "ID": "database-incremental-3d", "Status": "Enabled",
+      "Filter": { "Prefix": "ASSESSORIA/Database/incremental/" },
       "Expiration": { "Days": 3 } },
     { "ID": "logs-90d", "Status": "Enabled",
       "Filter": { "Prefix": "ASSESSORIA/Logs/" },
-      "Expiration": { "Days": 90 } }
+      "Expiration": { "Days": 90 } },
+    { "ID": "multipart-incompleto-7d", "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 } }
   ]
 }
 ```
@@ -504,9 +517,17 @@ completos e 3 dias para incrementais; ajuste os valores e o prefixo):
 aws s3api put-bucket-lifecycle-configuration --bucket <bucket-dominio> --lifecycle-configuration file://lifecycle.json
 ```
 
-O prefixo `ASSESSORIA/dominio/2` pega as pastas de data dos completos
-(`2026/...`) sem pegar `incremental/`. Com versionamento ou Object Lock no
-bucket, use também `NoncurrentVersionExpiration`.
+- O prefixo `ASSESSORIA/Database/2` pega as pastas de data dos completos
+  (`2026/...`) e não pega `incremental/`.
+- A última regra apaga partes de uploads interrompidos, que o rclone pode
+  deixar quando um envio grande falha. Essas partes não aparecem na listagem,
+  mas são cobradas.
+- Com versionamento ou Object Lock no bucket, use também
+  `NoncurrentVersionExpiration`.
+- O lifecycle só filtra por prefixo, tag e tamanho. Ele não sabe escolher "o
+  primeiro completo do mês". Para guardar uma cópia mensal por mais tempo, ela
+  precisa estar num prefixo próprio (por exemplo `<job>/mensal/`), com uma
+  regra própria.
 
 ### Monitoramento
 
@@ -516,21 +537,64 @@ horário incremental. Um completo também conta como sucesso dessa série.
 
 ### Restaurar completo + incremental
 
-1. Baixe e decifre o completo de base e o **último** incremental com
-   `BaseRunId` igual ao `RunId` do completo (veja `state.json`/`manifest.json`;
-   na prática, o último incremental antes do completo seguinte).
-2. Extraia o completo numa pasta de teste (`contabil.db` + `contabil.log`) e o
-   incremental numa subpasta (`incremental\contabil.log`).
-3. Numa máquina que **não** seja a de produção, aplique os logs na cópia:
+Sequência homologada em 23/11/2026, com SQL Anywhere 17.0.11.8360, age 1.3.2 e
+7-Zip 26.06. Faça sempre numa máquina isolada, **nunca** no servidor de
+produção, e trabalhe só em cópias. Para o processo de rotina, prefira um único
+incremental: o mais recente da base escolhida.
+
+1. **Escolha o par.** Use o completo e o incremental desejado **da mesma base**:
+   o `Metadata.BaseRunId` do `manifest.json` do incremental tem de ser igual ao
+   `RunId` do completo, e o `BaseRecoveryPointUtc` igual ao `StartedAtUtc` do
+   completo. Não confie só no nome ou na data do arquivo. Não empilhe vários
+   incrementais: cada um já contém tudo desde a base.
+2. **Decifre e confira.** Para cada `.7z.age`, rode `age -d -i <chave> -o x.7z`
+   e depois `7z t`, e extraia em pastas separadas, por exemplo `full\` e
+   `incremental\`. Confira cada arquivo contra o `manifest.json` (tamanho e
+   SHA-256). A chave de recuperação abre todos os pacotes.
+3. **Monte a cópia de trabalho.** Copie o conteúdo de `full\` (`Contabil.db`,
+   eventuais dbspaces e `contabil.log`) para `chain\`. Rode `dblog chain\Contabil.db`
+   e confirme que o log aponta para `contabil.log` relativo. Se apontar para um
+   caminho absoluto, principalmente de produção, não inicie o banco.
+4. **Aplique primeiro o log do completo** e espere o motor encerrar sozinho:
 
    ```bat
-   dbsrv17 -o restore.txt C:\Restore\contabil.db -a C:\Restore\contabil.log
-   dbsrv17 -o restore.txt C:\Restore\contabil.db -a C:\Restore\incremental\contabil.log
+   dbsrv17 -n homolog_restore -x none -o apply-full.txt chain\Contabil.db -a chain\contabil.log
    ```
 
-   Cada `-a` aplica o log e encerra o servidor. Depois, inicie normalmente e
-   valide (`dbvalid`).
-4. Apague os dados restaurados em texto puro ao terminar o teste.
+5. **Aplique em seguida o log do incremental.** Não inicie o banco normalmente
+   entre os passos 4 e 5:
+
+   ```bat
+   dbsrv17 -n homolog_restore -x none -o apply-incremental.txt chain\Contabil.db -a incremental\contabil.log
+   ```
+
+   Nos dois passos o esperado é código 0, `Recovery complete` e
+   `Database server shutdown automatically after log applied`.
+6. **Troque o log ao lado do banco.** Guarde o `chain\contabil.log` do completo
+   em outra pasta e coloque no lugar uma **cópia** de `incremental\contabil.log`.
+   Inicie o banco normalmente (`-n homolog_restore -x none`), rode `dbvalid` e
+   confira datas e quantidades em tabelas operacionais. Tabelas contábeis podem
+   ter datas futuras e não provam que o backup está recente. Encerre com `dbstop`.
+7. **Opcional:** `dbtran -y incremental\contabil.log incr.sql` mostra o período
+   das transações (marcadores `--BEGIN TRANSACTION`/`--COMMIT`). O arquivo tem
+   dados reais: não o compartilhe.
+8. **Apague** todos os dados restaurados em texto puro ao terminar o teste.
+
+`-n homolog_restore -x none` sobe um motor com nome próprio e sem rede (só
+memória compartilhada), para não colidir com o servidor de produção.
+
+**Erros conhecidos:**
+
+| Mensagem | Causa | O que fazer |
+| --- | --- | --- |
+| `Can't use log file ... since it has been used more recently than the database file` ao aplicar o incremental | faltou aplicar antes o log do completo | recomece de uma cópia intacta e siga os passos 4 e 5 |
+| `database file has been used more recently` ao iniciar depois dos replays | o log do completo ficou ao lado do banco | passo 6 |
+| `... since it is shorter than expected` | o log já foi aplicado (por exemplo, o mesmo incremental duas vezes) | não force; recomece de uma cópia intacta |
+| `BaseRunId` diferente, hash divergente, falta de dbspace ou erro no `dbvalid` | pacote ou cadeia incompatível | pare: não libere o banco; procure outro par |
+
+Nunca remova nem recrie o log para contornar um erro de recuperação. Ao colocar
+o banco em produção, entregue o `.db` recuperado com o `contabil.log` do
+incremental ao lado e gere um backup completo logo depois.
 
 ## Configurações versionadas
 
