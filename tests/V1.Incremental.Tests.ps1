@@ -135,7 +135,7 @@ Describe 'SQL Anywhere incremental provider' {
 Describe 'Log chain of the incrementals (foreign backup)' {
     BeforeAll {
         # Real dbtran output (pt-BR) of a copied contabil.log, plus the English wording.
-        $script:TranPt = "SQL Anywhere - Utilitario de traducao de log Versao 17.0.11.8360`r`nO registro de transacoes `"contabil.log`" comeca no deslocamento 013487586443`r`nLinha do tempo GUID atual: 9bb0cac0-d332-42d7-905d-55995f701e91`r`nHora de criacao UTC da linha do tempo atual: 2023-11-20 19:55:23.523787+00:00`r`nRegistro GUID de transacao atual: 00000000-0000-0000-0000-000000000000`r`nO registro de transacoes termina no deslocamento 013487702224`r`n"
+        $script:TranPt = "SQL Anywhere - Utilitario de conversao de registro Versao 17.0.11.8360`r`nO registro de transacoes `"C:\TI\Temp\dbcheck\incr\contabil.log`" inicia no deslocamento 013487586443`r`nLinha do tempo GUID atual: 9bb0cac0-d332-42d7-905d-55995f701e91`r`nHora de criacao UTC da linha do tempo atual: 2023-11-20 19:55:23.523787+00:00`r`nRegistro GUID de transacao atual: 00000000-0000-0000-0000-000000000000`r`n 100% terminado`r`nO registro de transacoes termina no deslocamento 013487702224`r`n"
         $script:TranEn = "Transaction log `"demo.log`" starts at offset 0000917328`nTransaction log ends at offset 0000918118`n"
     }
     BeforeEach {
