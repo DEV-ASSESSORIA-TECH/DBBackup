@@ -132,6 +132,151 @@ Describe 'SQL Anywhere incremental provider' {
     }
 }
 
+Describe 'Log chain of the incrementals (foreign backup)' {
+    BeforeAll {
+        # Real dbtran output (pt-BR) of a copied contabil.log, plus the English wording.
+        $script:TranPt = "SQL Anywhere - Utilitario de conversao de registro Versao 17.0.11.8360`r`nO registro de transacoes `"C:\TI\Temp\dbcheck\incr\contabil.log`" inicia no deslocamento 013487586443`r`nLinha do tempo GUID atual: 9bb0cac0-d332-42d7-905d-55995f701e91`r`nHora de criacao UTC da linha do tempo atual: 2023-11-20 19:55:23.523787+00:00`r`nRegistro GUID de transacao atual: 00000000-0000-0000-0000-000000000000`r`n 100% terminado`r`nO registro de transacoes termina no deslocamento 013487702224`r`n"
+        $script:TranEn = "Transaction log `"demo.log`" starts at offset 0000917328`nTransaction log ends at offset 0000918118`n"
+    }
+    BeforeEach {
+        $script:Root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
+        $bin = Join-Path $script:Root 'bin'
+        $null = New-Item -ItemType Directory $bin -Force
+        foreach ($name in 'dbbackup.exe', 'dbtran.exe') { Set-Content (Join-Path $bin $name) 'x' }
+        $options = Join-Path $script:Root 'connection.options'
+        Set-Content $options '-c "UID=''backup'';PWD=''test-secret'';SERVER=''srv'';DBN=''demo''"'
+        $script:C = @{ Tools = @{ DbBackup = (Join-Path $bin 'dbbackup.exe') } }
+        $script:R = [pscustomobject]@{ RunId = 'r1'; Work = (Join-Path $script:Root 'work') }
+        $script:J = [pscustomobject]@{ Id = 'dominio'; Provider = 'SQLAnywhere'; Database = 'demo'; CredentialFile = $options; Incremental = $true }
+        $script:Tran = $script:TranPt
+        $script:TranExit = 0
+        Mock Set-Acl {} -ModuleName Runtime
+        Mock Invoke-DBTool {
+            param($Executable, $Arguments)
+            if ($Executable -like '*dbbackup.exe') {
+                if ($Arguments -notcontains '-t') { Set-Content (Join-Path $Arguments[-1] 'demo.db') 'db' }
+                Set-Content (Join-Path $Arguments[-1] 'demo.log') 'log'
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($Executable -like '*dbtran.exe') {
+                # The translated SQL is written to the private folder of the run.
+                Set-Content $Arguments[-1] 'insert into segredo values (1)'
+                return [pscustomobject]@{ ExitCode = $script:TranExit; StdOut = $script:Tran; StdErr = '' }
+            }
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = '' }
+        } -ModuleName SQLAnywhere
+    }
+    It 'reads the start and end offsets from localized or English dbtran output' {
+        $pt = ConvertFrom-DBTranOutput $script:TranPt
+        $pt.Start | Should -Be '13487586443'
+        $pt.End | Should -Be '13487702224'
+        $en = ConvertFrom-DBTranOutput $script:TranEn
+        "$($en.Start)-$($en.End)" | Should -Be '917328-918118'
+        ConvertFrom-DBTranOutput "Registro GUID de transacao atual: 00000000-0000-0000-0000-000000000000`nO registro de transacoes termina no deslocamento 013487702224" | Should -BeNullOrEmpty
+        ConvertFrom-DBTranOutput '' | Should -BeNullOrEmpty
+    }
+    It 'records where the log of the full ends and deletes the translated SQL' {
+        $r = Invoke-DBSqlAnywhere $script:C $script:J $script:R
+        $r.Status | Should -Be 'SUCCESS'
+        $r.Metadata.LogEndOffset | Should -Be '13487702224'
+        $r.Errors | Should -BeNullOrEmpty
+        @(Get-ChildItem $script:R.Work -Recurse -Filter '*.sql').Count | Should -Be 0
+        Should -Invoke Invoke-DBTool -ModuleName SQLAnywhere -Times 1 -Exactly -ParameterFilter { $Executable -like '*dbtran.exe' -and $Arguments[1] -like '*demo.log' -and $Arguments[1] -like "$($script:R.Work)*" }
+    }
+    It 'accepts an incremental whose log starts where the base ended' {
+        $base = [pscustomobject]@{ BaseRunId = 'base1'; BaseRecoveryPointUtc = '2026-11-24T22:00:00.0000000Z'; LogEndOffset = '013487586443' }
+        $r = Invoke-DBSqlAnywhere $script:C $script:J $script:R -Mode Incremental -Base $base
+        $r.Status | Should -Be 'SUCCESS'
+        $r.Metadata.LogChain | Should -Be 'VERIFIED'
+        $r.Metadata.LogStartOffset | Should -Be '13487586443'
+    }
+    It 'discards the incremental when the log was restarted outside DBBackup' {
+        $base = [pscustomobject]@{ BaseRunId = 'base1'; BaseRecoveryPointUtc = '2026-11-24T22:00:00.0000000Z'; LogEndOffset = '13400000000' }
+        $r = Invoke-DBSqlAnywhere $script:C $script:J $script:R -Mode Incremental -Base $base
+        $r.Status | Should -Be 'CHAIN_BROKEN'
+        $r.Packages.Count | Should -Be 0
+        $r.Errors[0] | Should -Match 'ends at offset 13400000000, current log starts at 13487586443'
+        Test-Path (Join-Path $script:R.Work 'dominio') | Should -BeFalse
+    }
+    It 'asks for a full when the log cannot be read and only warns without dbtran or base offset' {
+        $base = [pscustomobject]@{ BaseRunId = 'base1'; BaseRecoveryPointUtc = '2026-11-24T22:00:00.0000000Z'; LogEndOffset = '13487586443' }
+        $script:TranExit = 7
+        (Invoke-DBSqlAnywhere $script:C $script:J $script:R -Mode Incremental -Base $base).Status | Should -Be 'CHAIN_UNVERIFIED'
+        $script:TranExit = 0
+        $old = [pscustomobject]@{ BaseRunId = 'base1'; BaseRecoveryPointUtc = '2026-11-24T22:00:00.0000000Z' }
+        $r = Invoke-DBSqlAnywhere $script:C $script:J $script:R -Mode Incremental -Base $old
+        $r.Status | Should -Be 'SUCCESS'
+        $r.Metadata.LogChain | Should -Be 'UNVERIFIED'
+        $r.Errors[0] | Should -Match 'without log offset'
+        Remove-Item (Join-Path (Split-Path $script:C.Tools.DbBackup) 'dbtran.exe')
+        $r = Invoke-DBSqlAnywhere $script:C $script:J $script:R -Mode Incremental -Base $base
+        $r.Status | Should -Be 'SUCCESS'
+        $r.Errors[0] | Should -Match 'dbtran.exe not found'
+    }
+    It 'keeps the offset in the base and reads bases written before 2.4' {
+        $c = @{ InstanceName = 'acme'; Paths = @{ RuntimeRoot = (Join-Path $script:Root 'Runtime') } }
+        Save-DBIncrementalBase -Configuration $c -Job 'dominio' -RunId 'r1' -RecoveryPointUtc ([DateTime]::UtcNow) -LogDirectory 'C:\Db' -LogEndOffset '13487702224'
+        (Read-DBIncrementalBase $c 'dominio').LogEndOffset | Should -Be '13487702224'
+        Save-DBIncrementalBase -Configuration $c -Job 'dominio' -RunId 'r1' -RecoveryPointUtc ([DateTime]::UtcNow) -LogDirectory 'C:\Db'
+        (Read-DBIncrementalBase $c 'dominio').LogEndOffset | Should -BeNullOrEmpty
+        $path = Get-DBIncrementalBasePath $c 'dominio'
+        $legacy = Get-Content $path -Raw | ConvertFrom-Json
+        $legacy.PSObject.Properties.Remove('LogEndOffset')
+        $legacy | ConvertTo-Json | Set-Content $path
+        (Read-DBIncrementalBase $c 'dominio').LogEndOffset | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Runner after a foreign backup cut the log' {
+    BeforeAll {
+        foreach ($name in 'Observation', 'Capacity', 'Runner') { Import-Module "$script:Repo/src/App/Modules/Core/$name.psm1" -Force }
+        Import-Module "$script:Repo/src/App/Modules/Providers/Providers.psm1" -Force
+    }
+    BeforeEach {
+        $script:Root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
+        $instance = Join-Path $script:Root 'acme'
+        $null = New-Item -ItemType Directory (Join-Path $instance 'Secrets') -Force
+        Set-Content (Join-Path $instance 'Secrets/dominio.options') '-c "UID=''backup'';PWD=''x'';SERVER=''srv'';DBN=''demo''"'
+        $text = Get-DBTestConfigText -InstanceName 'acme' -RemoteRoot 's3:bucket/ACME' -Tools @{ DbBackup = 'C:\SA\dbbackup.exe' }
+        $text = $text.Replace('Jobs = @(', "Jobs = @(@{ Id = 'dominio'; Provider = 'SQLAnywhere'; Database = 'demo'; CredentialFile = 'Secrets/dominio.options'; RemoteRoot = 's3:bucket/ACME'; Incremental = @{ Enabled = `$true } }, ")
+        $script:Config = Join-Path $instance 'config.psd1'
+        Set-Content $script:Config $text
+        $script:Calls = [Collections.Generic.List[string]]::new()
+        $script:Published = [Collections.Generic.List[string]]::new()
+        Mock Set-Acl {} -ModuleName Runtime
+        Mock Write-Error {} -ModuleName Runner
+        Mock Assert-DBBackupDependency {} -ModuleName Runner
+        Mock Assert-DBFreeSpace {} -ModuleName Runner
+        Mock Remove-DBExpired {} -ModuleName Runner
+        Mock Publish-DBLog {} -ModuleName Runner
+        Mock Publish-DBPackage {} -ModuleName Runner
+        Mock Remove-DBRenamedLog { @() } -ModuleName Runner
+        Mock Publish-DBJobMonitoring { $script:Published.Add("$Mode=$Status"); $true } -ModuleName Runner
+        Mock Invoke-DBProvider {
+            $script:Calls.Add($Mode)
+            $now = [DateTime]::UtcNow
+            if ($Mode -eq 'Incremental') {
+                return [pscustomobject]@{ Status = 'CHAIN_BROKEN'; Packages = @(); Errors = @('Log chain restarted outside DBBackup.'); StartedAtUtc = $now; FinishedAtUtc = $now; Metadata = @{} }
+            }
+            [pscustomobject]@{ Status = 'SUCCESS'; Packages = @([pscustomobject]@{ Role = 'FULL'; SourcePath = $TestDrive; ContentsOnly = $true }); Errors = @()
+                StartedAtUtc = $now; FinishedAtUtc = $now; Metadata = @{ ProductionLogDirectory = 'C:\Db'; LogEndOffset = '13500000000' } }
+        } -ModuleName Runner
+    }
+    It 'runs a full at once, records the new base and ends degraded with the log series degraded' {
+        $c = Read-DBConfiguration $script:Config
+        Save-DBIncrementalBase -Configuration $c -Job 'dominio' -RunId 'old' -RecoveryPointUtc ([DateTime]::UtcNow.AddHours(-20)) -LogDirectory 'C:\Db' -LogEndOffset '13400000000'
+        Invoke-DBBackup -ConfigPath $script:Config -Job 'dominio' -Mode Incremental | Should -Be 5
+        $script:Calls -join ',' | Should -Be 'Incremental,Full'
+        $script:Published -join ',' | Should -Be 'Full=SUCCESS,Incremental=DEGRADED'
+        $base = Read-DBIncrementalBase $c 'dominio'
+        $base.BaseRunId | Should -Not -Be 'old'
+        $base.LogEndOffset | Should -Be '13500000000'
+        $log = Get-Content (Get-ChildItem (Join-Path (Split-Path $script:Config) 'Logs') -Filter '*.log' -Recurse | Select-Object -First 1).FullName -Raw
+        $log | Should -Match 'Log chain restarted outside DBBackup'
+        $log | Should -Match 'cadeia do log reiniciada fora do DBBackup'
+    }
+}
+
 Describe 'Incremental retention and renamed logs' {
     BeforeEach {
         $script:Root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))

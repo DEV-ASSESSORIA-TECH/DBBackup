@@ -7,6 +7,9 @@ renames and restarts the production log (dbbackup -r) and becomes the base;
 each incremental copies the current log (dbbackup -t), i.e. everything since
 the base. Restore = base full + latest incremental of that base.
 The base is kept in <Runtime>\Incremental\<job>.json.
+LogEndOffset (2.4) is where the log copied by the base full ends, i.e. where
+the restarted production log begins: an incremental whose log starts at
+another offset was cut by a backup outside DBBackup (chain restarted).
 #>
 
 function Get-DBIncrementalBasePath {
@@ -24,11 +27,15 @@ function Read-DBIncrementalBase {
     # ConvertFrom-Json may already return a DateTime: keep a round-trip UTC string.
     $time = if ($base.BaseRecoveryPointUtc -is [DateTime]) { $base.BaseRecoveryPointUtc } else { [DateTime]::Parse([string] $base.BaseRecoveryPointUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
     $base.BaseRecoveryPointUtc = $time.ToUniversalTime().ToString('o')
+    # Bases written before 2.4 have no offset: the chain is not verified until the next full.
+    if (-not $base.PSObject.Properties['LogEndOffset']) { $base | Add-Member -NotePropertyName LogEndOffset -NotePropertyValue $null }
+    elseif ($null -ne $base.LogEndOffset) { $base.LogEndOffset = [string] $base.LogEndOffset }
     return $base
 }
 
 function Save-DBIncrementalBase {
-    param([Collections.IDictionary] $Configuration, [string] $Job, [string] $RunId, [DateTime] $RecoveryPointUtc, [AllowNull()][string] $LogDirectory)
+    param([Collections.IDictionary] $Configuration, [string] $Job, [string] $RunId, [DateTime] $RecoveryPointUtc, [AllowNull()][string] $LogDirectory,
+        [AllowNull()][string] $LogEndOffset)
     $path = Get-DBIncrementalBasePath $Configuration $Job
     Set-DBPrivateDirectory (Split-Path -Parent $path)
     $temp = "$path.$([guid]::NewGuid().ToString('N')).tmp"
@@ -36,6 +43,7 @@ function Save-DBIncrementalBase {
         @{
             SchemaVersion = 1; Instance = $Configuration.InstanceName; Job = $Job; BaseRunId = $RunId
             BaseRecoveryPointUtc = $RecoveryPointUtc.ToUniversalTime().ToString('o'); ProductionLogDirectory = $LogDirectory
+            LogEndOffset = $(if ($LogEndOffset) { $LogEndOffset } else { $null })
         } | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding utf8 -ErrorAction Stop
         [IO.File]::Move($temp, $path, $true)
     }

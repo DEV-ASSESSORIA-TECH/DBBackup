@@ -79,7 +79,7 @@ function Merge-DBEnvironment {
         if ($Configuration.Contains($section)) { foreach ($key in $Configuration[$section].Keys) { $merged[$key] = $Configuration[$section][$key] } }
         $Configuration[$section] = $merged
     }
-    # Tools.SqlAnywhere is a folder (...\Tools or ...\Bin64) holding dbbackup.exe and dbping.exe.
+    # Tools.SqlAnywhere is a folder (...\Tools or ...\Bin64) holding dbbackup.exe, dbping.exe and dbtran.exe.
     if ($Configuration.Tools.Contains('SqlAnywhere')) {
         if (-not $Configuration.Tools.Contains('DbBackup')) { $Configuration.Tools.DbBackup = Join-Path ([string] $Configuration.Tools.SqlAnywhere) 'dbbackup.exe' }
         $Configuration.Tools.Remove('SqlAnywhere')

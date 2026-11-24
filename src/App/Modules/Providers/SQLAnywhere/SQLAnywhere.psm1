@@ -105,13 +105,62 @@ function Get-DBSqlAnywhereLogDirectory {
     catch { return $null }
 }
 
+function ConvertFrom-DBTranOutput {
+    <#
+    Start and end offsets of a transaction log read from the dbtran messages,
+    in any language: the line that ends the log ("...ends at offset N",
+    "...termina no deslocamento N") gives End; the first other line ending in
+    an offset gives Start. Offsets are digit strings without leading zeros.
+    $null when the output is not understood.
+    #>
+    param([AllowNull()][string] $Text)
+    $start = $null
+    $end = $null
+    foreach ($line in ([string] $Text) -split '\r?\n') {
+        # A space before the number: GUIDs (-000000000000), versions and times never match.
+        $match = [regex]::Match($line, '\s(?<n>\d{6,})\s*\.?\s*$')
+        if (-not $match.Success) { continue }
+        $value = $match.Groups['n'].Value.TrimStart('0')
+        if (-not $value) { $value = '0' }
+        if ($line -match '(?i)\b(ends?|termina|finaliza)\b') { $end = $value }
+        elseif ($line -match '(?i)relativ') { continue }
+        elseif ($null -eq $start) { $start = $value }
+    }
+    if ($null -eq $start -or $null -eq $end -or [decimal] $start -gt [decimal] $end) { return $null }
+    return [pscustomobject]@{ Start = $start; End = $end }
+}
+
+function Read-DBSqlAnywhereLogOffset {
+    <#
+    Offsets of a transaction log COPIED to Work (never the production one),
+    read with dbtran. The translated SQL holds data: it goes to the private
+    folder of the run and is deleted right away. Throws when unreadable.
+    #>
+    param([string] $DbTran, [string] $LogPath, [string] $PrivateDirectory, [double] $TimeoutSeconds = 3600)
+    $sql = Join-Path $PrivateDirectory "dbtran-$([guid]::NewGuid().ToString('N')).sql"
+    try {
+        $run = Invoke-DBTool -Executable $DbTran -Arguments @('-y', $LogPath, $sql) -TimeoutSeconds $TimeoutSeconds
+        if ($run.ExitCode -ne 0) { throw "dbtran failed (exit $($run.ExitCode)). $(ConvertTo-DBSafeToolOutput -Text "$($run.StdOut) $($run.StdErr)" -MaxLength 500)".Trim() }
+        $offsets = ConvertFrom-DBTranOutput "$($run.StdOut)`n$($run.StdErr)"
+        if ($null -eq $offsets) { throw 'dbtran output not understood (log start and end offsets).' }
+        return $offsets
+    }
+    finally { if (Test-Path -LiteralPath $sql) { Remove-Item -LiteralPath $sql -Force } }
+}
+
 function Invoke-DBSqlAnywhere {
     <#
     Mode Full: database and log (dbbackup). For a job with Incremental.Enabled
     the full also renames and restarts the production log (-r), so it becomes
     the base of the day's incrementals. Mode Incremental: only the current
     log (-t, no rename): cumulative since the base full. Base = state of the
-    base full (BaseRunId, BaseRecoveryPointUtc) given by the runner.
+    base full (BaseRunId, BaseRecoveryPointUtc, LogEndOffset) given by the runner.
+    Log chain (2.4, needs dbtran.exe beside dbbackup.exe): the full records
+    where its copied log ends; the incremental checks that its copied log
+    starts there. Another offset means a backup outside DBBackup truncated or
+    renamed the production log: the copy is discarded and Status is
+    CHAIN_BROKEN (the runner takes a full right away). An unreadable log with
+    a known base offset gives CHAIN_UNVERIFIED (full for safety).
     #>
     param([Collections.IDictionary] $Configuration, $Job, $Runtime, [ValidateSet('Full','Incremental')][string] $Mode = 'Full', $Base)
     $started = [DateTime]::UtcNow
@@ -148,6 +197,44 @@ function Invoke-DBSqlAnywhere {
         foreach ($file in @($dbs) + @($logs)) {
             if ($file.Length -eq 0) { throw 'SQL Anywhere produced an empty database or log file.' }
         }
+        $warnings = @()
+        $offsets = $null
+        $offsetError = $null
+        if ($incrementalJob) {
+            $toolFolder = [IO.Path]::GetDirectoryName([string] $Configuration.Tools.DbBackup)
+            $dbtran = if ($toolFolder) { Join-Path $toolFolder 'dbtran.exe' } else { $null }
+            if (-not $dbtran -or -not (Test-Path -LiteralPath $dbtran -PathType Leaf)) { $warnings += "dbtran.exe not found beside dbbackup.exe: log chain not verified." }
+            elseif ($logs.Count -ne 1) { $warnings += "$($logs.Count) logs copied: log chain not verified." }
+            else {
+                try { $offsets = Read-DBSqlAnywhereLogOffset -DbTran $dbtran -LogPath $logs[0].FullName -PrivateDirectory $secretRoot -TimeoutSeconds $timeout }
+                catch { $offsetError = Protect-DBMessage $_.Exception.Message }
+            }
+        }
+        $chain = 'UNVERIFIED'
+        if ($Mode -eq 'Incremental') {
+            $expected = if ($Base.PSObject.Properties['LogEndOffset'] -and $Base.LogEndOffset) { ([string] $Base.LogEndOffset).TrimStart('0') } else { $null }
+            if ($null -ne $expected -and -not $expected) { $expected = '0' }
+            if (-not $expected) { $warnings += 'Base full without log offset (taken before 2.4 or without dbtran): log chain not verified until the next full.' }
+            elseif ($null -ne $offsets -and $offsets.Start -cne $expected) {
+                # The copy would not apply on top of the base: never publish it.
+                Remove-Item -LiteralPath $root -Recurse -Force
+                return [pscustomobject]@{
+                    Status = 'CHAIN_BROKEN'; Packages = @(); StartedAtUtc = $started; FinishedAtUtc = [DateTime]::UtcNow
+                    Errors = @("Log chain restarted outside DBBackup: base $($Base.BaseRunId) ends at offset $expected, current log starts at $($offsets.Start). The incremental was discarded.")
+                    Metadata = @{ ExpectedLogStartOffset = $expected; FoundLogStartOffset = $offsets.Start }
+                }
+            }
+            elseif ($null -ne $offsets) { $chain = 'VERIFIED' }
+            elseif ($offsetError) {
+                Remove-Item -LiteralPath $root -Recurse -Force
+                return [pscustomobject]@{
+                    Status = 'CHAIN_UNVERIFIED'; Packages = @(); StartedAtUtc = $started; FinishedAtUtc = [DateTime]::UtcNow
+                    Errors = @("Log chain could not be checked ($offsetError). The incremental was discarded.")
+                    Metadata = @{ ExpectedLogStartOffset = $expected }
+                }
+            }
+        }
+        elseif ($offsetError) { $warnings += "Log end offset not read ($offsetError): the incrementals of this base will not be verified." }
         $metadata = @{
             Strategy = $(if ($Mode -eq 'Incremental') { 'native-cumulative-transaction-log' } else { 'native-full-database-and-log' }); Database = $Job.Database
             Kind = $(if ($Mode -eq 'Incremental') { 'INCREMENTAL' } else { 'FULL' })
@@ -156,10 +243,11 @@ function Invoke-DBSqlAnywhere {
             DatabaseFiles = @($dbs | ForEach-Object Name); LogFiles = @($logs | ForEach-Object Name)
         }
         if ($logDirectory) { $metadata.ProductionLogDirectory = $logDirectory }
-        if ($Mode -eq 'Incremental') { $metadata.BaseRunId = [string] $Base.BaseRunId; $metadata.BaseRecoveryPointUtc = [string] $Base.BaseRecoveryPointUtc }
+        if ($Mode -eq 'Incremental') { $metadata.BaseRunId = [string] $Base.BaseRunId; $metadata.BaseRecoveryPointUtc = [string] $Base.BaseRecoveryPointUtc; $metadata.LogChain = $chain }
+        if ($null -ne $offsets) { $metadata.LogStartOffset = $offsets.Start; $metadata.LogEndOffset = $offsets.End }
         [pscustomobject]@{
             Status = 'SUCCESS'; Packages = @([pscustomobject]@{ Role = $metadata.Kind; SourcePath = $root; ContentsOnly = $true })
-            Errors = @(); StartedAtUtc = $started; FinishedAtUtc = [DateTime]::UtcNow
+            Errors = $warnings; StartedAtUtc = $started; FinishedAtUtc = [DateTime]::UtcNow
             Metadata = $metadata
         }
     }
@@ -169,4 +257,4 @@ function Invoke-DBSqlAnywhere {
         if (Test-Path -LiteralPath $secretRoot) { Remove-Item -LiteralPath $secretRoot -Recurse -Force -ErrorAction Stop }
     }
 }
-Export-ModuleMember -Function Get-DBSqlAnywhereLogDirectory, Read-DBSqlConnection, Write-DBSqlOption, ConvertTo-DBSafeToolOutput, Get-DBSqlAnywhereSizeEstimate, Invoke-DBSqlAnywhere
+Export-ModuleMember -Function ConvertFrom-DBTranOutput, Read-DBSqlAnywhereLogOffset, Get-DBSqlAnywhereLogDirectory, Read-DBSqlConnection, Write-DBSqlOption, ConvertTo-DBSafeToolOutput, Get-DBSqlAnywhereSizeEstimate, Invoke-DBSqlAnywhere

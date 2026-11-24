@@ -43,6 +43,9 @@ function Invoke-DBBackup {
     monitoring textfile); 0 success. 2 configuration/dependency; 3 lock busy.
     Mode Incremental runs the cumulative log backup of SQL Anywhere jobs with
     Incremental.Enabled; without a valid base the job is promoted to a full.
+    When the copied log does not continue the base (a backup outside DBBackup
+    cut the production log) the incremental is discarded, a full runs at once
+    and the run ends degraded (5); the -log series reports DEGRADED.
     #>
     param([string] $ConfigPath, [string] $Job, [switch] $All, [ValidateSet('Full','Incremental')][string] $Mode = 'Full')
     try {
@@ -115,6 +118,9 @@ function Invoke-DBBackup {
             $jobStatus = 'FAILED'
             $jobMode = $Mode
             $base = $null
+            # Incremental replaced by a full in this run because of the log chain:
+            # $null, 'CHAIN_BROKEN' (degraded, log series) or 'CHAIN_UNVERIFIED'.
+            $replaced = $null
             try {
                 if ($jobMode -eq 'Incremental') {
                     try { $base = Read-DBIncrementalBase $c $j.Id }
@@ -144,6 +150,16 @@ function Invoke-DBBackup {
                 $label = if ($jobMode -eq 'Incremental') { 'incremental (transaction log)' } else { 'backup' }
                 Write-DBLog $runtime.LogPath $j.Id "Step 1/4: $($j.Provider) $label of $source started."
                 $result = Invoke-DBProvider -Configuration $c -Job $j -Runtime $runtime -Mode $jobMode -Base $base
+                if ($result.Status -in @('CHAIN_BROKEN','CHAIN_UNVERIFIED')) {
+                    # A backup outside DBBackup cut the production log (or the copy could
+                    # not be checked): the incrementals of the old base end here. A full
+                    # now restarts the chain; a broken chain leaves the run degraded.
+                    foreach ($errorMessage in $result.Errors) { Write-DBLog $runtime.LogPath $j.Id $errorMessage 'WARN' }
+                    $replaced = $result.Status
+                    $jobMode = 'Full'
+                    Write-DBLog $runtime.LogPath $j.Id 'Step 1/4: full backup now, it becomes the new base of the incrementals.' 'WARN'
+                    $result = Invoke-DBProvider -Configuration $c -Job $j -Runtime $runtime -Mode Full
+                }
                 if ($result.Status -eq 'SUCCESS' -and $j.Provider -ne 'Directory' -and $jobMode -eq 'Full') {
                     try {
                         [long] $payloadBytes = 0
@@ -175,7 +191,9 @@ function Invoke-DBBackup {
                     # base. If it was not packaged, the next incremental is a full.
                     if ($published -eq $result.Packages.Count -and $published -gt 0 -and $result.Status -ne 'FAILED') {
                         $logDirectory = if ($result.Metadata.Contains('ProductionLogDirectory')) { [string] $result.Metadata.ProductionLogDirectory } else { $null }
-                        Save-DBIncrementalBase -Configuration $c -Job $j.Id -RunId $runtime.RunId -RecoveryPointUtc $result.StartedAtUtc -LogDirectory $logDirectory
+                        $logEnd = if ($result.Metadata.Contains('LogEndOffset')) { [string] $result.Metadata.LogEndOffset } else { $null }
+                        Save-DBIncrementalBase -Configuration $c -Job $j.Id -RunId $runtime.RunId -RecoveryPointUtc $result.StartedAtUtc -LogDirectory $logDirectory -LogEndOffset $logEnd
+                        if ($logEnd) { Write-DBLog $runtime.LogPath $j.Id "New incremental base; its log ends at offset $logEnd." }
                         if (-not $logDirectory) { Write-DBLog $runtime.LogPath $j.Id 'Production log folder unknown (dbping LogName); renamed logs are not cleaned.' 'WARN' }
                     }
                     else { Clear-DBIncrementalBase -Configuration $c -Job $j.Id }
@@ -189,12 +207,18 @@ function Invoke-DBBackup {
                 }
                 if ($published -eq $result.Packages.Count -and $published -gt 0 -and $result.Status -ne 'FAILED') { $jobStatus = $result.Status }
                 if ($result.Status -eq 'DEGRADED') { $degraded = $true; $degradedJobs.Add($j.Id) }
+                if ($replaced -eq 'CHAIN_BROKEN' -and $jobStatus -eq 'SUCCESS') { $degraded = $true; $degradedJobs.Add("$($j.Id) (cadeia do log reiniciada fora do DBBackup; completo feito)") }
                 foreach ($errorMessage in $result.Errors) { Write-DBLog $runtime.LogPath $j.Id $errorMessage 'WARN' }
                 Write-DBLog $runtime.LogPath $j.Id "Local result: $($result.Status); published packages: $published."
             }
             catch { $failed = $true; $failedJobs.Add($j.Id); Write-DBLog $runtime.LogPath $j.Id $_.Exception.Message 'ERROR' }
             finally {
                 if (-not (Publish-DBJobMonitoring -Configuration $c -Job $j -Status $jobStatus -DurationSeconds $watch.Elapsed.TotalSeconds -LogPath $runtime.LogPath -Mode $jobMode)) { $maintenance = $false; $auxiliary.Add("monitoramento ($($j.Id))") }
+                if ($replaced) {
+                    # The incremental series also gets this attempt: degraded when the chain broke.
+                    $logStatus = if ($replaced -eq 'CHAIN_BROKEN' -and $jobStatus -eq 'SUCCESS') { 'DEGRADED' } else { $jobStatus }
+                    if (-not (Publish-DBJobMonitoring -Configuration $c -Job $j -Status $logStatus -DurationSeconds $watch.Elapsed.TotalSeconds -LogPath $runtime.LogPath -Mode Incremental)) { $maintenance = $false; $auxiliary.Add("monitoramento ($($j.Id)-log)") }
+                }
                 $null = $monitored.Add($j.Id)
             }
         }

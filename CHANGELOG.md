@@ -4,6 +4,22 @@ Todas as alterações relevantes do DBBackup são registradas neste arquivo. O
 projeto usa as versões semânticas definidas em `VERSION` e as principais seções
 do Keep a Changelog, sem exigir todas as seções em cada versão.
 
+## [2.4.0] - 2026-11-24
+
+### Adicionado
+
+- Conferência da cadeia do log do incremental do SQL Anywhere.
+  - O completo grava na base onde termina o log copiado (`LogEndOffset`).
+  - Cada incremental confere, com `dbtran` na cópia em Work, se o log começa
+    ali.
+  - Log reiniciado por backup feito fora do DBBackup: o incremental é
+    descartado, um completo roda na hora e vira a nova base. A execução termina
+    **degradada** (código 5) e a série `-log` publica `DEGRADED` (BKP-111).
+  - Leitura falhou: completo por segurança, sem degradar.
+  - Sem `dbtran.exe` ou com base anterior à 2.4.0: incremental normal, com
+    aviso. O diagnóstico avisa as duas situações.
+- `dbtran.exe` passa a ser esperado na pasta de ferramentas do SQL Anywhere.
+
 ## [2.3.0] - 2026-11-23
 
 ### Adicionado
