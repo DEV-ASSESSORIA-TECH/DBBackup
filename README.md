@@ -41,7 +41,7 @@ publicação confirmada; não certifica restauração.
 
 Requer Windows, PowerShell 7.2+ (instalador MSI), 7-Zip, age e rclone; para MySQL,
 `mysql.exe`/`mysqldump.exe`; para SQL Anywhere, a pasta de ferramentas 17
-(`dbbackup.exe` e `dbping.exe`).
+(`dbbackup.exe`, `dbping.exe` e, para o incremental, `dbtran.exe`).
 
 1. Confira o SHA-256 do `DBBackup-X.Y.Z.zip` com o `.zip.sha256`.
 2. Extraia numa pasta, por exemplo `C:\TI\Scripts\DBBackup`.

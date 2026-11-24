@@ -1,4 +1,4 @@
-# DBBackup — runbook v2.3.0
+# DBBackup — runbook v2.4.0
 
 ## Conceitos
 
@@ -18,9 +18,10 @@ que a tarefa SYSTEM pode não executar). 7-Zip, age e rclone instalados
 separadamente. MySQL precisa de mysql/mysqldump 5.x compatíveis com a origem.
 SQL Anywhere precisa da pasta de ferramentas 17 (`...\SQL Anywhere 17\Tools`
 no pacote reduzido ou `...\Bin64` numa instalação completa) com `dbbackup.exe`
-e `dbping.exe`. O `dbping` é usado no teste de conexão, na estimativa de espaço
-da primeira execução e para achar a pasta do log de produção (limpeza dos logs
-renomeados do incremental). O DBBackup não
+e `dbping.exe`; com incremental, também `dbtran.exe`. O `dbping` é usado no
+teste de conexão, na estimativa de espaço da primeira execução e para achar a
+pasta do log de produção (limpeza dos logs renomeados do incremental). O
+`dbtran` confere a cadeia do log (ver "Backup feito fora do DBBackup"). O DBBackup não
 instala dependências.
 
 1. Confira o SHA-256 do ZIP contra o `.zip.sha256`.
@@ -466,6 +467,10 @@ incremental daquele completo.
   `<RemoteRoot>/<job>/incremental/aaaa/mm/dd/`.
 - Sem base válida (primeira execução, ou completo que falhou depois de renomear
   o log), o incremental é **promovido a completo** e o log registra o aviso.
+- O completo grava na base onde termina o log que ele copiou
+  (`LogEndOffset`). Cada incremental confere se o log copiado começa ali
+  (`Metadata.LogChain = VERIFIED` no manifesto). Ver "Backup feito fora do
+  DBBackup".
 - Logs renomeados (`AAMMDDxx.log`) são apagados da pasta do banco só depois que
   o completo de base foi confirmado no S3 e quando têm mais de
   `KeepRenamedLogDays` dias. O log atual (`contabil.log`) nunca é tocado.
@@ -585,6 +590,36 @@ guardado até você tratá-lo.
 O incremental publica uma série própria: `backup_id="<id do job>-log"`,
 `kind="log"`, com prazo (`backup_success_due_timestamp_seconds`) pelo próximo
 horário incremental. Um completo também conta como sucesso dessa série.
+
+### Backup feito fora do DBBackup
+
+Um backup do banco feito por outro processo (por exemplo, o backup manual do
+sistema antes de uma atualização) trunca ou renomeia o log de produção. Os
+incrementais seguintes não aplicariam sobre o completo de base.
+
+O DBBackup detecta isso no incremental seguinte:
+
+| Situação | O que acontece |
+| --- | --- |
+| Log copiado começa onde o completo de base terminou | incremental normal |
+| Log começa em outro offset (cadeia reiniciada) | incremental descartado, **completo na hora** (nova base); execução **DEGRADADA** (código 5), série `-log` degradada → **BKP-111** |
+| `dbtran` falhou ao ler o log copiado | incremental descartado, completo na hora por segurança; sem degradar |
+| `dbtran.exe` ausente ou base anterior à 2.4.0 | incremental normal, com `WARN` "log chain not verified" |
+
+O que se perde: só os pontos intermediários entre o último incremental bom e o
+backup externo. Os incrementais anteriores continuam válidos com a base antiga,
+e o completo novo cobre tudo até agora.
+
+No log da execução:
+
+```text
+WARN [dominio] Log chain restarted outside DBBackup: base <RunId> ends at offset <E>, current log starts at <S>. The incremental was discarded.
+WARN [dominio] Step 1/4: full backup now, it becomes the new base of the incrementals.
+RESULTADO: DEGRADADO (... jobs degradados: dominio (cadeia do log reiniciada fora do DBBackup; completo feito))
+```
+
+Tratamento: descobrir quem fez o backup e quando. Nada a corrigir no DBBackup;
+o alerta fecha no próximo incremental normal.
 
 ### Restaurar completo + incremental
 

@@ -226,9 +226,12 @@ function Test-DBInstance {
         $dbping = Join-Path (Split-Path -Parent $Configuration.Tools.DbBackup) 'dbping.exe'
         if (-not (Test-Path -LiteralPath $dbping -PathType Leaf)) { Write-Warning "dbping.exe nao esta na pasta do dbbackup.exe ($(Split-Path -Parent $Configuration.Tools.DbBackup)): sem estimativa de tamanho nem limpeza dos logs renomeados." }
         if (-not $job.Incremental) { continue }
+        $dbtran = Join-Path (Split-Path -Parent $Configuration.Tools.DbBackup) 'dbtran.exe'
+        if (-not (Test-Path -LiteralPath $dbtran -PathType Leaf)) { Write-Warning "Job $($job.Id): dbtran.exe nao esta na pasta do dbbackup.exe; a cadeia do log dos incrementais nao sera verificada (backup feito fora do DBBackup passaria despercebido)." }
         $base = Read-DBIncrementalBase $Configuration $job.Id
         if ($null -eq $base) { Write-Warning "Job $($job.Id): incremental sem backup completo de base; o proximo incremental sera promovido a completo." }
         elseif (-not $base.ProductionLogDirectory) { Write-Warning "Job $($job.Id): pasta do log de producao desconhecida; os logs renomeados (AAMMDDxx.log) nao serao limpos." }
+        if ($null -ne $base -and -not $base.LogEndOffset) { Write-Warning "Job $($job.Id): base sem offset do log (anterior a 2.4.0); a cadeia so passa a ser verificada depois do proximo completo." }
         $incrementalTasks = @(Get-DBScheduleTask $Configuration | Where-Object { $_.Mode -eq 'Incremental' -and $job.Id -cin @($_.Jobs) })
         if (-not $incrementalTasks.Count) { Write-Warning "Job $($job.Id): Incremental.Enabled sem tarefa Mode = 'Incremental' na agenda." }
     }
@@ -344,7 +347,7 @@ function Read-DBToolPath {
     param([Collections.IDictionary] $Tools, [string] $Key, [switch] $IfMissing)
     $labels = @{
         MySql = 'Executavel mysql.exe'; MySqlDump = 'Executavel mysqldump.exe'
-        SqlAnywhere = 'Pasta das ferramentas do SQL Anywhere com dbbackup.exe e dbping.exe (...\Tools ou ...\Bin64)'
+        SqlAnywhere = 'Pasta das ferramentas do SQL Anywhere com dbbackup.exe, dbping.exe e dbtran.exe (...\Tools ou ...\Bin64)'
         SevenZip = 'Executavel 7z.exe'; Age = 'Executavel age.exe'; Rclone = 'Executavel rclone.exe'
     }
     $default = if ($Tools.Contains($Key)) { [string] $Tools[$Key] } else { '' }
